@@ -19,7 +19,7 @@ pub const map = struct {
 
     /// 片内 SRAM：BL 的 load_addr 0x70008000 就落在这里（已由镜像确认）
     pub const sram_base = 0x7000_0000;
-    pub const sram_size = 0x0010_0000; // 1MB（run761 地图；256KB 不够，pc 冲出边界）
+    pub const sram_size = 0x0020_0000; // 2MB（run761 写 1MB，实测执行冲到 1MB 顶，再扩试探）
 
     /// flash/EMI 窗口：MAUI 的 load_addr = 0x1000_0000 + 文件偏移，说明整片
     /// flash 被线性映射到这里，MAUI 直接在上面 XIP（已由镜像确认）
@@ -85,8 +85,10 @@ pub const Machine = struct {
     lowram_wr: u32 = 0,
     bp_logged: bool = false,
     bp_bss: bool = false,
+    bss_calls: u32 = 0,
     remaped_low_ram: bool = false,
     last_r10: u32 = 0,
+    wild_jumped: bool = false,
 
     regions: [2]RegionCtx = undefined,
     /// UART1/2/3 的行缓冲（固件串口输出，按 \n / \r / 满行刷新）
@@ -425,17 +427,13 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
     m.instrs += 1;
     m.exec_hist[m.exec_hist_pos % m.exec_hist.len] = @truncate(address);
     m.exec_hist_pos += 1;
-    if (address == 0x70009b20 and !m.bp_bss) {
-        m.bp_bss = true;
+    if (address == 0x70009b20 and m.bss_calls < 32) {
+        m.bss_calls += 1;
         var r0: u32 = 0;
         var r1: u32 = 0;
-        var r2: u32 = 0;
-        var r3: u32 = 0;
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
-        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R2, &r2);
-        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R3, &r3);
-        log.info(@src(), "  [断点] 0x70009b20 BSS清理: r0=0x{x:0>8} r1=0x{x:0>8} r2=0x{x:0>8} r3=0x{x:0>8}", .{ r0, r1, r2, r3 });
+        log.info(@src(), "  [BSS清理 #{d}] r0=0x{x:0>8} → r1=0x{x:0>8} ({d} 字节)", .{ m.bss_calls, r0, r1, r1 -| r0 });
     }
     // 服务函数调用日志（BootROM 服务：0x7000e100 + i*4）
     if (address >= 0x7000_E100 and address < 0x7000_E110) {
@@ -478,6 +476,20 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         log.info(@src(), "  [入口] #{d} pc=0x{x:0>8} bytes={x:0>2}{x:0>2} {x:0>2}{x:0>2}", .{
             m.instrs, address, code[0], code[1], code[2], code[3],
         });
+    }
+    // 首次越界执行：PC 冲出已知代码区（>0x7000b000）时记录现场
+    if (address >= 0x7000_B000 and !m.wild_jumped) {
+        m.wild_jumped = true;
+        var lr: u32 = 0;
+        var r0: u32 = 0;
+        var r1r: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1r);
+        log.info(@src(), "  [越界执行] pc=0x{x:0>8} lr=0x{x:0>8} r0=0x{x:0>8} r1=0x{x:0>8} (instrs={d})", .{
+            address, lr, r0, r1r, m.instrs,
+        });
+        m.dumpExecHist();
     }
     if (address == 0x10008061) {
         log.info(@src(), "★ 阶段切换: 进入 BL2 (0x10008061)", .{});
