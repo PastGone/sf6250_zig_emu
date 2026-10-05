@@ -34,6 +34,12 @@ pub const map = struct {
 
 const max_faults = 256;
 
+// BootROM 交接上下文（模拟器扮演 BootROM 合成，见 docs/mt6250-wiring.md）
+// 地址选在 0x70041000+：BL 的 BSS 清理范围全部止于 0x70040000 以下
+const bootrom_ctx_base: u32 = 0x7004_1000;
+const bootrom_svc_table: u32 = 0x7004_2000;
+const bootrom_svc_code: u32 = 0x7004_2100;
+
 /// 已接线的寄存器区块（地址→名字）。行为依据见 docs/mt6250-wiring.md。
 pub const known_regions = [_]struct { base: u32, name: []const u8 }{
     .{ .base = 0xA005_0000, .name = "CLK/PLL" },
@@ -83,12 +89,17 @@ pub const Machine = struct {
     tbl_wr: u32 = 0,
     hook_lowram: c.uc_hook = 0,
     lowram_wr: u32 = 0,
+    hook_svcwr: c.uc_hook = 0,
+    svc_wr: u32 = 0,
     bp_logged: bool = false,
     bp_bss: bool = false,
     bss_calls: u32 = 0,
+    bss_last_r0: u32 = 0,
+    bss_last_r1: u32 = 0,
     remaped_low_ram: bool = false,
     last_r10: u32 = 0,
     wild_jumped: bool = false,
+    stack_exec: bool = false,
 
     regions: [2]RegionCtx = undefined,
     /// UART1/2/3 的行缓冲（固件串口输出，按 \n / \r / 满行刷新）
@@ -122,6 +133,8 @@ pub const Machine = struct {
         try m.eng.hookMem(&m.hook_tblwr, c.UC_HOOK_MEM_WRITE, 0x7000A100, 0x7000A1FF, onTblWrite, m);
         // 监视低 RAM（0x0~0x10000）写入：内核 RAM 函数安装区
         try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x0, 0xFFFF, onLowRamWrite, m);
+        // 监视服务表+服务代码写入：谁改写了我们登记的服务指针/代码
+        try m.eng.hookMem(&m.hook_svcwr, c.UC_HOOK_MEM_WRITE, bootrom_svc_table, bootrom_svc_code + 0x20, onSvcTableWrite, m);
         return m;
     }
 
@@ -157,9 +170,9 @@ pub const Machine = struct {
     /// 服务表 +0x00/+0x08/+0x18/+0x34 → 四个服务，先实现为「返回 0」，
     /// 参数通过 onCode 的 svc 日志观察后逐步充实。
     fn setupBootromContext(self: *Machine) !void {
-        const ctx: u32 = 0x7000_D000;
-        const svc: u32 = 0x7000_E000;
-        const svc_code: u32 = 0x7000_E100;
+        const ctx: u32 = bootrom_ctx_base;
+        const svc: u32 = bootrom_svc_table;
+        const svc_code: u32 = bootrom_svc_code;
 
         // TLV：首记录 0x6b422101 + 长度 4，终止符 0x6820d104
         try self.eng.memWrite(ctx, &.{ 0x01, 0x21, 0x42, 0x6b });
@@ -168,16 +181,24 @@ pub const Machine = struct {
         // [ctx+0x28] = TLV 总大小
         try self.eng.memWrite(ctx + 0x28, &.{ 0x0c, 0, 0, 0 });
         // [ctx+0x8DC] = 服务表指针
-        try self.eng.memWrite(ctx + 0x8DC, &.{ 0x00, 0xe0, 0x00, 0x70 });
+        try self.eng.memWrite(ctx + 0x8DC, &.{
+            @truncate(bootrom_svc_table),
+            @truncate(bootrom_svc_table >> 8),
+            @truncate(bootrom_svc_table >> 16),
+            @truncate(bootrom_svc_table >> 24),
+        });
         // 服务表：+0x00/+0x08/+0x18/+0x34 → 四个服务函数
         const slots = [_]u32{ 0x00, 0x08, 0x18, 0x34 };
         for (slots, 0..) |off, i| {
             const a = svc + off;
+            // 函数指针必须带 Thumb 位（bit0=1），否则 blx 切到 ARM 模式
+            // 执行 Thumb 桩字节 → 条件跳过 → 滑进零区
+            const fnptr = svc_code + @as(u32, @intCast(i)) * 4 + 1;
             try self.eng.memWrite(a, &.{
-                @truncate(svc_code + @as(u32, @intCast(i)) * 4),
-                @truncate((svc_code + @as(u32, @intCast(i)) * 4) >> 8),
-                @truncate((svc_code + @as(u32, @intCast(i)) * 4) >> 16),
-                0x70,
+                @truncate(fnptr),
+                @truncate(fnptr >> 8),
+                @truncate(fnptr >> 16),
+                @truncate(fnptr >> 24),
             });
         }
         // 服务函数体：movs r0,#0; bx lr（Thumb: 00 20 70 47）
@@ -239,7 +260,7 @@ pub const Machine = struct {
         // BootROM 交接：r10 = 共享数据区（BL 全程不赋值，只作为入参使用）。
         // 结构由 BootROM 预先备好，这里合成最小版本（见 setupBootromContext）。
         try self.setupBootromContext();
-        const ctx: u32 = 0x7000_D000;
+        const ctx: u32 = bootrom_ctx_base;
         // 入口指令流（实测）：mrs/orr/msr 关中断 → mov r10, r4 → blx 初始化链。
         // BootROM 把共享数据指针放在 r4，BL 自己拷进 r10。
         try self.eng.regWrite(c.UC_ARM_REG_R4, &ctx);
@@ -427,16 +448,20 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
     m.instrs += 1;
     m.exec_hist[m.exec_hist_pos % m.exec_hist.len] = @truncate(address);
     m.exec_hist_pos += 1;
-    if (address == 0x70009b20 and m.bss_calls < 32) {
+    if (address == 0x70009b20) {
         m.bss_calls += 1;
         var r0: u32 = 0;
         var r1: u32 = 0;
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
-        log.info(@src(), "  [BSS清理 #{d}] r0=0x{x:0>8} → r1=0x{x:0>8} ({d} 字节)", .{ m.bss_calls, r0, r1, r1 -| r0 });
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        std.debug.print("[BSS #{d}] 0x{x:0>8} -> 0x{x:0>8} lr=0x{x:0>8}\n", .{ m.bss_calls, r0, r1, lr });
+        m.bss_last_r0 = r0;
+        m.bss_last_r1 = r1;
     }
-    // 服务函数调用日志（BootROM 服务：0x7000e100 + i*4）
-    if (address >= 0x7000_E100 and address < 0x7000_E110) {
+    // 服务函数调用日志（BootROM 服务：0x70042100 + i*4）
+    if (address >= 0x7004_2100 and address < 0x7004_2110) {
         var a0: u32 = 0;
         var a1r: u32 = 0;
         var a2r: u32 = 0;
@@ -478,7 +503,31 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         });
     }
     // 首次越界执行：PC 冲出已知代码区（>0x7000b000）时记录现场
-    if (address >= 0x7000_B000 and !m.wild_jumped) {
+    // 服务区之后的无人区被执行 = 滑行起点，抓第一现场
+    if (address >= 0x7004_3000 and address < 0x701F_D000 and !m.stack_exec) {
+        m.stack_exec = true;
+        var lr: u32 = 0;
+        var sp: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_SP, &sp);
+        log.info(@src(), "  [滑行起点] pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} (instrs={d})", .{
+            address, lr, sp, m.instrs,
+        });
+        m.dumpExecHist();
+    }
+    // 栈区被执行 = 返回地址/函数指针损坏，抓第一现场
+    if (address >= 0x701FE000 and !m.stack_exec) {
+        m.stack_exec = true;
+        var lr: u32 = 0;
+        var sp: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_SP, &sp);
+        log.info(@src(), "  [栈执行] pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} (instrs={d})", .{
+            address, lr, sp, m.instrs,
+        });
+        m.dumpExecHist();
+    }
+    if (address >= 0x7004_2110 and address < 0x701F_D000 and !m.wild_jumped) {
         m.wild_jumped = true;
         var lr: u32 = 0;
         var r0: u32 = 0;
@@ -541,6 +590,24 @@ fn onTblWrite(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: 
         });
     }
     m.tbl_wr += 1;
+    return true;
+}
+
+/// 服务表写监视：抓改写服务指针的代码（前 16 次）
+fn onSvcTableWrite(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: c_int, value: i64, user: ?*anyopaque) callconv(.c) bool {
+    _ = typ;
+    _ = size;
+    const m: *Machine = @ptrCast(@alignCast(user));
+    if (m.svc_wr < 16) {
+        var pc: u32 = 0;
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_PC, &pc);
+        _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [服务表写] pc=0x{x:0>8} lr=0x{x:0>8} -> [0x{x:0>8}] = 0x{x:0>8}", .{
+            pc, lr, address, @as(u64, @bitCast(value)),
+        });
+    }
+    m.svc_wr += 1;
     return true;
 }
 
