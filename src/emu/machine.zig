@@ -22,9 +22,9 @@ pub const map = struct {
     /// flash 被线性映射到这里，MAUI 直接在上面 XIP（已由镜像确认）
     pub const flash_window_base = 0x1000_0000;
 
-    /// 外设寄存器：MTK 基带常见落在这两段，具体分布待实测
+    /// 外设寄存器：apb 段到外部 RAM（0x82000000，run761 实测）为止
     pub const apb_base = 0x8000_0000;
-    pub const apb_size = 0x1000_0000;
+    pub const apb_size = 0x200_0000;
     pub const ahb_base = 0xa000_0000;
     pub const ahb_size = 0x1000_0000;
 };
@@ -126,6 +126,15 @@ pub const Machine = struct {
         }));
     }
 
+    /// 外部 RAM（0x82000000 起 64MB）：BL 堆与共享数据区、MAUI 重定位目标
+    /// （run761 实测 MAUI 在 0x84Exxxxx 执行）——见 docs/mt6250-wiring.md 内存图
+    pub fn mapExternalRam(self: *Machine) !void {
+        const base = 0x8200_0000;
+        const size = 0x400_0000;
+        try self.eng.memMap(base, size, uc.Perm.combine(&.{ .read, .write, .exec }));
+        log.info(@src(), "外部 RAM: 0x{x:0>8}..0x{x:0>8} ({d} MB, RWX)", .{ base, base + size, size >> 20 });
+    }
+
     /// 外设窗口挂成 MMIO：已接线的寄存器按 docs/mt6250-wiring.md 给行为，
     /// 其余读 0/写丢弃并记名——这是「黑盒推进」的抓手。
     pub fn mapPeriphStubs(self: *Machine) !void {
@@ -196,7 +205,7 @@ pub const Machine = struct {
         };
 
         log.info(@src(), "执行 {d} 条指令, 最终 pc=0x{x:0>8}", .{ self.instrs, self.readPc() catch 0 });
-    self.dumpExecHist();
+        self.dumpExecHist();
         self.reportFaults();
     }
 
@@ -375,7 +384,7 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         log.info(@src(), "  [断点] 0x700082e0 入口: r0=0x{x:0>8} r1=0x{x:0>8} lr=0x{x:0>8}", .{ r0, r1, lr });
         m.dumpExecHist();
         // 导出运行时 SRAM hex，供离线反汇编（蹦床 + 传参处两段）
-        inline for (.{ 0x70009900, 0x70008200, 0x70009A80 }) |base| {
+        inline for (.{ 0x70009200, 0x70009300, 0x70009400, 0x70009500, 0x70009600, 0x70009700, 0x70009800, 0x70009900, 0x70009A00 }) |base| {
             var mem: [0x100]u8 = undefined;
             if (c.uc_mem_read(engine, base, &mem, mem.len) == c.UC_ERR_OK) {
                 var hx: [3 * 0x100]u8 = undefined;

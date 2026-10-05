@@ -65,6 +65,10 @@ pub fn main(init: std.process.Init) !void {
         log.err(@src(), "failed to map flash window (rc={s})", .{@errorName(err)});
         return;
     };
+    mach.mapExternalRam() catch |err| {
+        log.err(@src(), "failed to map external RAM (rc={s})", .{@errorName(err)});
+        return;
+    };
     // 外设层常驻：已接线寄存器给行为，其余读 0/写丢弃并记名
     mach.mapPeriphStubs() catch |err| {
         log.err(@src(), "failed to map peripherals (rc={s})", .{@errorName(err)});
