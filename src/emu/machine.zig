@@ -76,16 +76,26 @@ pub const Machine = struct {
 
     hook_code: c.uc_hook = 0,
     hook_mem: c.uc_hook = 0,
+    hook_tblwr: c.uc_hook = 0,
+    tbl_wr: u32 = 0,
+    bp_logged: bool = false,
 
     regions: [2]RegionCtx = undefined,
     /// UART1/2/3 的行缓冲（固件串口输出，按 \n / \r / 满行刷新）
     uart_line: [3][121]u8 = undefined,
     uart_len: [3]usize = @splat(0),
+    /// 0xA0050090 时钟切换命令寄存器的当前命令（写后状态位按命令应答）
+    clk_cmd: u32 = 0,
+
+    /// 末尾执行轨迹（诊断用：看停机/空转前在跑什么）
+    exec_hist: [64]u32 = @splat(0),
+    exec_hist_pos: usize = 0,
 
     /// 去重后的未映射访问地址（用来反推外设分布）
     fault_addrs: [max_faults]u64 = @splat(0),
     fault_count: usize = 0,
     fault_kinds: [max_faults][:0]const u8 = undefined,
+    fault_counts: [max_faults]u64 = @splat(0),
 
     pub fn init(allocator: std.mem.Allocator) !*Machine {
         // ARM7EJ-S 是 ARMv5TEJ，Unicorn 没有该型号，用同为 ARMv5TEJ 的 ARM926 近似。
@@ -98,6 +108,8 @@ pub const Machine = struct {
 
         try m.eng.hookCode(&m.hook_code, onCode, m);
         try m.eng.hookMemInvalid(&m.hook_mem, onMemInvalid, m);
+        // 监视 BL 回调表区的写入（诊断：谁注册了/没人注册）
+        try m.eng.hookMem(&m.hook_tblwr, c.UC_HOOK_MEM_WRITE, 0x7000A100, 0x7000A1FF, onTblWrite, m);
         return m;
     }
 
@@ -183,6 +195,7 @@ pub const Machine = struct {
         };
 
         log.info(@src(), "执行 {d} 条指令, 最终 pc=0x{x:0>8}", .{ self.instrs, self.readPc() catch 0 });
+    self.dumpExecHist();
         self.reportFaults();
     }
 
@@ -192,22 +205,51 @@ pub const Machine = struct {
         return v;
     }
 
+    /// 末尾执行轨迹：按时间顺序打印最近的 PC（诊断空转/停机原因）
+    fn dumpExecHist(self: *const Machine) void {
+        const n = @min(self.exec_hist_pos, self.exec_hist.len);
+        if (n == 0) return;
+        var buf: [64 * 10]u8 = undefined;
+        var len: usize = 0;
+        var i: usize = 0;
+        const start = if (self.exec_hist_pos > n) self.exec_hist_pos % n else 0;
+        while (i < n) : (i += 1) {
+            const pc = self.exec_hist[(start + i) % self.exec_hist.len];
+            const part = std.fmt.bufPrint(buf[len..], "{x:0>8} ", .{pc}) catch break;
+            len += part.len;
+        }
+        log.info(@src(), "末尾轨迹: {s}", .{buf[0..len]});
+    }
+
     /// 记下地址；返回 true 表示这是第一次见到
     fn recordFault(self: *Machine, addr: u64, kind: [:0]const u8) bool {
         for (0..self.fault_count) |i| {
-            if (self.fault_addrs[i] == addr) return false;
+            if (self.fault_addrs[i] == addr) {
+                self.fault_counts[i] += 1;
+                return false;
+            }
         }
         if (self.fault_count >= max_faults) return false;
         self.fault_addrs[self.fault_count] = addr;
         self.fault_kinds[self.fault_count] = kind;
+        self.fault_counts[self.fault_count] = 1;
         self.fault_count += 1;
         return true;
     }
 
     fn reportFaults(self: *const Machine) void {
-        for (0..self.fault_count) |i| {
-            log.info(@src(), "  未实现访问 #{d}: {s} @0x{x:0>8}", .{
-                i, self.fault_kinds[i], self.fault_addrs[i],
+        // 按访问次数降序：排最前的往往是被轮询的状态寄存器
+        var idx: [max_faults]usize = undefined;
+        for (0..self.fault_count) |i| idx[i] = i;
+        const less = struct {
+            fn f(ctx: []const u64, a: usize, b: usize) bool {
+                return ctx[b] < ctx[a];
+            }
+        }.f;
+        std.mem.sort(usize, idx[0..self.fault_count], self.fault_counts[0..self.fault_count], less);
+        for (idx[0..self.fault_count]) |i| {
+            log.info(@src(), "  未实现访问 #{d}: {s} @0x{x:0>8} x{d}", .{
+                i, self.fault_kinds[i], self.fault_addrs[i], self.fault_counts[i],
             });
         }
     }
@@ -228,8 +270,16 @@ fn uartPutc(self: *Machine, i: usize, b: u8) void {
 
 /// 已接线寄存器的读行为；其余记录后读 0
 fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
-    // 时钟/PLL 状态：bit7=就绪、bit0=busy 清（BL 0x70008AAC 轮询的位）
-    if (addr == 0xA005_0090) return 0x80;
+    // 时钟切换握手（BL 0x70008aac~0x70008aba）：写命令后轮询 bit7，
+    // 0x300F0000→等 bit7=1，0x700F0000→等 bit7=0（0x100F0000 推测同为 1）
+    if (addr == 0xA005_0090) {
+        return switch (self.clk_cmd) {
+            0x300F_0000, 0x100F_0000 => 0x80,
+            else => 0x00,
+        };
+    }
+    // PLL 锁定状态：bit1=锁定（BL 0x7000868e 轮询；写 0xA0050300/0x308 配置后等它）
+    if (addr == 0xA005_0318) return 0x2;
     // EMI/总线命令状态：bit0=0（命令已完成，BL 0x70008FA8 轮询的位）
     if (addr == 0xA018_00A0) return 0x00;
 
@@ -257,6 +307,13 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
             return;
         }
     }
+    if (addr == 0xA005_0090) { // 时钟切换命令
+        if (self.recordFault(addr, "clk-cmd")) {
+            log.info(@src(), "  时钟切换命令 write 0x{x}", .{value});
+        }
+        self.clk_cmd = @truncate(value);
+        return;
+    }
     if (addr == 0xA018_00A0) { // EMI/总线命令：busy 位写后自清
         if (self.recordFault(addr, "emi-cmd")) {
             log.info(@src(), "  EMI 总线命令 write 0x{x}（busy 自清）", .{value});
@@ -283,12 +340,49 @@ fn onMmioWrite(_: ?*c.uc_engine, offset: u64, size: c_uint, value: u64, user: ?*
     periphWrite(ctx.machine, @truncate(ctx.base + offset), size, value);
 }
 
-fn onCode(_: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) callconv(.c) void {
+fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) callconv(.c) void {
     const m: *Machine = @ptrCast(@alignCast(user));
     m.instrs += 1;
+    m.exec_hist[m.exec_hist_pos % m.exec_hist.len] = @truncate(address);
+    m.exec_hist_pos += 1;
+    if (address == 0x10008061) {
+        log.info(@src(), "★ 阶段切换: 进入 BL2 (0x10008061)", .{});
+    }
+    if (address == 0x10020301) {
+        log.info(@src(), "★ 阶段切换: 进入 MAUI (0x10020301)", .{});
+    }
+    if (address == 0x700082e0 and !m.bp_logged) {
+        m.bp_logged = true;
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [断点] 0x700082e0 入口: r0=0x{x:0>8} r1=0x{x:0>8} lr=0x{x:0>8}", .{ r0, r1, lr });
+        m.dumpExecHist();
+    }
     if (m.trace) {
         log.debug(@src(), "pc=0x{x:0>8} size={d}", .{ address, size });
     }
+}
+
+/// 回调表写监视：记录 PC 与写入值（前 32 次）
+fn onTblWrite(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: c_int, value: i64, user: ?*anyopaque) callconv(.c) bool {
+    _ = typ;
+    _ = size;
+    const m: *Machine = @ptrCast(@alignCast(user));
+    if (address == 0x7000A114) {
+        var pc: u32 = 0;
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_PC, &pc);
+        _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [表写] pc=0x{x:0>8} lr=0x{x:0>8} -> [0x{x:0>8}] = 0x{x:0>8}", .{
+            pc, lr, address, @as(u64, @bitCast(value)),
+        });
+    }
+    m.tbl_wr += 1;
+    return true;
 }
 
 fn onMemInvalid(

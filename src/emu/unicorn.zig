@@ -136,6 +136,11 @@ pub const Engine = struct {
         try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_CODE, @ptrCast(@constCast(cb)), ctx, 1, 0));
     }
 
+    /// 带地址范围的内存访问钩子（UC_HOOK_MEM_WRITE/READ 等）
+    pub fn hookMem(self: *const Engine, hh: *c.uc_hook, typ: c_int, begin: u64, end: u64, cb: c.uc_cb_eventmem_t, ctx: ?*anyopaque) Error!void {
+        try check(c.uc_hook_add(self.handle, hh, typ, @constCast(@ptrCast(cb)), ctx, begin, end));
+    }
+
     /// 非法/未映射访问：返回 false 表示让 Unicorn 停下并报错
     pub fn hookMemInvalid(self: *const Engine, hh: *c.uc_hook, cb: c.uc_cb_eventmem_t, ctx: ?*anyopaque) Error!void {
         try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_MEM_INVALID, @ptrCast(@constCast(cb)), ctx, 1, 0));

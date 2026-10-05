@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
         log.err(@src(), "failed to map peripherals (rc={s})", .{@errorName(err)});
         return;
     };
-    mach.run(2_000_000);
+    mach.run(20_000_000);
 
     // 2. LCD：窗口 + 一帧占位画面；带 --lcd 时进入事件循环
     var disp = try emu.Display.init("MT6250", lcd_width, lcd_height, 2);
