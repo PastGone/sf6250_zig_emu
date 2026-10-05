@@ -92,8 +92,8 @@ pub const TailInfo = struct {
 pub const BootImage = struct {
     /// 不拥有数据，指向调用者的缓冲区；调用者必须保证数据在 BootImage 使用期间有效。
     data: []const u8 = &.{},
-    boot: fmt.GenBootHeader = .{},
-    brlyt: fmt.BromLayoutHeader = .{},
+    boot: fmt.BootHeader = .{},
+    brlyt: fmt.BromLayout = .{},
     brlyt_region_count: u32 = 0,
 
     project: [64]u8 = @splat(0),
@@ -144,7 +144,7 @@ fn imageCollectGfh(img: *BootImage, im: *Image) void {
         e.size = h.size;
         e.version = h.version;
         const body = base[cur + 8 ..][0 .. h.size - 8];
-        e.body = fmt.gfhBodyRead(h.type, h.size, body);
+        e.body = fmt.gfhBodyRead(h.type, h.size, base[cur..]);
 
         if (looksLikeStr(body)) fixedStr(&e.name, body);
 

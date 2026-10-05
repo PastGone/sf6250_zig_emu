@@ -4,8 +4,9 @@
 //! 反推的（反推部分都标了 `推测`），避免把猜测当成规范。所有 on-flash 字段为小端。
 //!
 //! 本文件只做子包的公共 API 汇总，实现分散在同目录的各模块里：
-//! - `format.zig`：**全部 on-flash 格式定义**（对标 mtk_image.h 的角色：结构、
-//!   魔数、常量，以及把字节绑到字段的 read/isValid）
+//! - `format.zig`：**全部 on-flash 格式定义**。官方区（与 docs/mtk_image.h.txt
+//!   1:1 的 extern 定义 + 编译期大小断言）→ 实测扩展区（本镜像观测反推，标
+//!   *推测*）→ 解析函数区（拷贝到栈上官方结构再取字段）
 //! - `bytes.zig`：小端读取、定长字符串、CRC32 等通用零件
 //! - `image.zig`：解析结果数据结构与登记/扫描逻辑
 //! - `parse.zig`：解析入口与文件加载
@@ -16,12 +17,18 @@ const image = @import("image.zig");
 const parse_mod = @import("parse.zig");
 
 // 1. 设备头
+pub const GenBootHeader = fmt.GenBootHeader; // 官方 1:1 extern 定义
+pub const BootHeader = fmt.BootHeader; // 解析值
 pub const boot_name_emmc = fmt.boot_name_emmc;
 pub const boot_name_sf = fmt.boot_name_sf;
 pub const boot_name_sdmmc = fmt.boot_name_sdmmc;
-pub const GenBootHeader = fmt.GenBootHeader;
 
 // 2. BootROM 布局头
+pub const BromLayoutHeader = fmt.BromLayoutHeader; // 官方 1:1 extern 定义
+pub const BromLayout = fmt.BromLayout; // 解析值（含实测扩展槽位）
+pub const BromLayoutRegion = fmt.BromLayoutRegion;
+pub const RegionKind = fmt.RegionKind;
+pub const BrlytImgType = fmt.BrlytImgType;
 pub const brlyt_name = fmt.brlyt_name;
 pub const brlyt_magic = fmt.brlyt_magic;
 pub const brlyt_region_size = fmt.brlyt_region_size;
@@ -29,21 +36,20 @@ pub const brlyt_max_regions = fmt.brlyt_max_regions;
 pub const brlyt_index_reserved = fmt.brlyt_index_reserved;
 pub const sram_window_base = fmt.sram_window_base;
 pub const sram_window_mask = fmt.sram_window_mask;
-pub const RegionKind = fmt.RegionKind;
-pub const BromLayoutRegion = fmt.BromLayoutRegion;
-pub const BromLayoutHeader = fmt.BromLayoutHeader;
-pub const BromLayout = fmt.BromLayout;
 pub const brlytRegionIndex = fmt.brlytRegionIndex;
 pub const brlytRegionFlash = fmt.brlytRegionFlash;
 pub const flash_type = fmt.flash_type;
 pub const flashTypeName = fmt.flashTypeName;
 
 // 3. GFH
-pub const gfh_file_info_name = fmt.gfh_file_info_name;
 pub const GfhCommonHeader = fmt.GfhCommonHeader;
-pub const gfh_type = fmt.gfh_type;
+pub const GfhFileInfo = fmt.GfhFileInfo;
+pub const GfhType = fmt.GfhType;
+pub const GfhFlashType = fmt.GfhFlashType;
+pub const GfhSigType = fmt.GfhSigType;
 pub const GfhBody = fmt.GfhBody;
-pub const FileInfo = fmt.FileInfo;
+pub const gfh_file_info_name = fmt.gfh_file_info_name;
+pub const gfh_type = fmt.gfh_type;
 pub const sig_type_none = fmt.sig_type_none;
 pub const sig_type_sha256 = fmt.sig_type_sha256;
 pub const file_type = fmt.file_type;

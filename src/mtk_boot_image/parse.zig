@@ -45,11 +45,11 @@ pub fn parse(buf: []const u8, out: *image.BootImage) ParseError!void {
     out.data = buf;
 
     // 1. 设备头
-    out.boot = fmt.GenBootHeader.read(buf);
+    out.boot = fmt.BootHeader.read(buf);
     if (!out.boot.isValid()) return ParseError.BadBoot;
 
     // 2. BRLYT 布局头 + region 表
-    out.brlyt = fmt.BromLayoutHeader.read(buf[fmt.brlyt_offset..]);
+    out.brlyt = fmt.BromLayout.read(buf[fmt.brlyt_offset..]);
     if (!out.brlyt.isValid()) return ParseError.BadBrlyt;
     out.brlyt_region_count = out.brlyt.usedRegions();
 
