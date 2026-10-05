@@ -8,22 +8,20 @@ const firstNonEqual = bytes.firstNonEqual;
 const lastNonEqual = bytes.lastNonEqual;
 const findAscii = bytes.findAscii;
 
-const boot_header = @import("boot_header.zig");
-const gfh = @import("gfh.zig");
-const brlyt = @import("brlyt.zig");
+const fmt = @import("format.zig");
 
 pub const image_max = 16;
 pub const gfh_max = 16;
 
 pub const GfhEntry = struct {
     offset: u32 = 0,
-    @"type": u16 = 0,
+    type: u16 = 0,
     size: u16 = 0,
     version: u8 = 0,
     // 仅用于 dump 展示，不是 on-flash 字段：官方头里只有 gfh_file_info 的
     // name[12]，这里要装下 PROJECT_INFO 里的完整工程名，故取 63 字节 + NUL。
     name: [64]u8 = @splat(0),
-    body: gfh.GfhBody = .empty,
+    body: fmt.GfhBody = .empty,
 };
 
 /// 完整性/一致性检查的结果。任何一项为真都应该在 dump 里用 warn 报出来。
@@ -94,8 +92,8 @@ pub const TailInfo = struct {
 pub const BootImage = struct {
     /// 不拥有数据，指向调用者的缓冲区；调用者必须保证数据在 BootImage 使用期间有效。
     data: []const u8 = &.{},
-    boot: boot_header.GenBootHeader = .{},
-    brlyt: brlyt.BromLayoutHeader = .{},
+    boot: fmt.GenBootHeader = .{},
+    brlyt: fmt.BromLayoutHeader = .{},
     brlyt_region_count: u32 = 0,
 
     project: [64]u8 = @splat(0),
@@ -121,36 +119,36 @@ fn imageFindSlot(img: *BootImage, offset: u32) ?*Image {
 /// 或这份数据有问题，应当告警而不是静默丢弃。
 fn imageCollectGfh(img: *BootImage, im: *Image) void {
     const base = img.data;
-    var cur: usize = im.offset + gfh.file_info_size;
+    var cur: usize = im.offset + fmt.gfh_file_info_size;
     const end: usize = im.offset + im.hdr_size;
 
-    if (im.hdr_size < gfh.file_info_size or end > img.data.len) {
+    if (im.hdr_size < fmt.gfh_file_info_size or end > img.data.len) {
         im.integrity.bad_hdr_size = true;
         im.gfh_chain_end = @intCast(cur);
         return;
     }
 
-    while (cur + gfh.common_header_size <= end) {
+    while (cur + fmt.gfh_common_header_size <= end) {
         if (im.gfh_count >= gfh_max) {
             im.integrity.gfh_truncated = true;
             break;
         }
-        if (!gfh.magicOk(base[cur..])) break;
+        if (!fmt.gfhMagicOk(base[cur..])) break;
 
-        const h = gfh.read(base[cur..]);
-        if (h.size < gfh.common_header_size or cur + h.size > end) break;
+        const h = fmt.gfhRead(base[cur..]);
+        if (h.size < fmt.gfh_common_header_size or cur + h.size > end) break;
 
         const e = &im.gfh[im.gfh_count];
         e.offset = @intCast(cur);
-        e.@"type" = h.@"type";
+        e.type = h.type;
         e.size = h.size;
         e.version = h.version;
         const body = base[cur + 8 ..][0 .. h.size - 8];
-        e.body = gfh.bodyRead(h.@"type", h.size, body);
+        e.body = fmt.gfhBodyRead(h.type, h.size, body);
 
         if (looksLikeStr(body)) fixedStr(&e.name, body);
 
-        if (h.@"type" == gfh.gfh_type.project_info and looksLikeStr(body))
+        if (h.type == fmt.gfh_type.project_info and looksLikeStr(body))
             fixedStr(&img.project, body);
 
         im.gfh_count += 1;
@@ -165,10 +163,10 @@ fn imageCollectGfh(img: *BootImage, im: *Image) void {
 /// 返回：加载到哪个槽位（找不到返回 null）
 pub fn imageAdd(img: *BootImage, offset: u32) ?*Image {
     if (img.image_count >= image_max) return null;
-    if (offset + gfh.file_info_size > img.data.len) return null;
-    if (!gfh.fileInfoValid(img.data[offset..])) return null;
+    if (offset + fmt.gfh_file_info_size > img.data.len) return null;
+    if (!fmt.fileInfoValid(img.data[offset..])) return null;
 
-    const fi = gfh.fileInfoRead(img.data[offset..]);
+    const fi = fmt.fileInfoRead(img.data[offset..]);
     if (fi.total_size == 0 or offset + fi.total_size > img.data.len) {
         img.scan.rejected += 1;
         return null;
@@ -200,7 +198,7 @@ pub fn imageAdd(img: *BootImage, offset: u32) ?*Image {
     fixedStr(&im.name, img.data[offset + 8 ..]);
 
     // 完整性：本工具不做签名验证，但至少把需要留意的点标记出来
-    if (im.sig_type != gfh.sig_type_none) im.integrity.sig_unverified = true;
+    if (im.sig_type != fmt.sig_type_none) im.integrity.sig_unverified = true;
     if (im.hdr_size > im.total_size) im.integrity.bad_hdr_size = true;
     if (im.hdr_size +| im.sig_size > im.total_size) im.integrity.sig_overlap = true;
 
@@ -225,8 +223,8 @@ pub fn imageScanAll(img: *BootImage) void {
     const size = img.data.len;
     var off: usize = 0;
 
-    while (off + gfh.file_info_size <= size and img.image_count < image_max) {
-        if (!gfh.fileInfoValid(img.data[off..])) {
+    while (off + fmt.gfh_file_info_size <= size and img.image_count < image_max) {
+        if (!fmt.fileInfoValid(img.data[off..])) {
             off += 1;
             continue;
         }

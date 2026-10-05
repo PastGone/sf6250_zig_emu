@@ -6,8 +6,7 @@ const bytes = @import("bytes.zig");
 const cstr = bytes.cstr;
 const hexPreview = bytes.hexPreview;
 
-const brlyt = @import("brlyt.zig");
-const gfh = @import("gfh.zig");
+const fmt = @import("format.zig");
 const image = @import("image.zig");
 
 pub fn dump(img: *const image.BootImage) void {
@@ -21,36 +20,36 @@ pub fn dump(img: *const image.BootImage) void {
         img.brlyt.header_size,
         img.brlyt.total_size,
         img.brlyt_region_count,
-        brlyt.brlyt_max_regions,
+        fmt.brlyt_max_regions,
     });
 
     if (img.project[0] != 0)
         log.info(@src(), "  project: \"{s}\"", .{cstr(&img.project)});
 
-    for (0..brlyt.brlyt_max_regions) |i| {
+    for (0..fmt.brlyt_max_regions) |i| {
         const rg = &img.brlyt.region[i];
 
-        if (rg.magic != brlyt.brlyt_magic) {
+        if (rg.magic != fmt.brlyt_magic) {
             log.info(@src(), "    region[{d}]: <empty>", .{i});
             continue;
         }
 
-        const index = brlyt.brlytRegionIndex(rg.@"type");
-        const flash = brlyt.brlytRegionFlash(rg.@"type");
+        const index = fmt.brlytRegionIndex(rg.type);
+        const flash = fmt.brlytRegionFlash(rg.type);
 
         switch (rg.kind()) {
             .memory_view => {
                 log.info(@src(), "    region[{d}]: index=0x{x:0>4} flash=0x{x:0>4} memory view addr=0x{x:0>8} size=0x{x:0>8} flags=0x{x:0>8}", .{
                     i, index, flash, rg.start, rg.size(), rg.unused,
                 });
-                if (index != brlyt.brlyt_index_reserved) {
+                if (index != fmt.brlyt_index_reserved) {
                     log.warn(@src(), "      region[{d}]: index != 0xfffe 但 start 落在 SRAM 窗口，语义待确认", .{i});
                 }
             },
             .file_offset => {
                 var label: []const u8 = "<unresolved>";
                 for (img.image[0..img.image_count]) |*candidate| {
-                    if (candidate.offset == rg.start) label = gfh.fileTypeName(candidate.file_type);
+                    if (candidate.offset == rg.start) label = fmt.fileTypeName(candidate.file_type);
                 }
                 log.info(@src(), "    region[{d}]: index=0x{x:0>4} flash=0x{x:0>4} @0x{x:0>8}..0x{x:0>8} size=0x{x:0>8} flags=0x{x:0>8} -> {s}", .{
                     i, index, flash, rg.start, rg.end_or_size, rg.size(), rg.unused, label,
@@ -82,13 +81,13 @@ pub fn dump(img: *const image.BootImage) void {
             im.end,
             im.total_size,
             im.file_type,
-            gfh.fileTypeName(im.file_type),
+            fmt.fileTypeName(im.file_type),
             im.load_addr,
             im.entry_point,
             im.jump_offset,
             im.sig_type,
             im.flash_type,
-            brlyt.flashTypeName(im.flash_type),
+            fmt.flashTypeName(im.flash_type),
             im.processed,
             im.max_size,
             im.hdr_size,
@@ -132,7 +131,8 @@ pub fn dump(img: *const image.BootImage) void {
                 .brom_sec_cfg => |v| std.fmt.bufPrint(&preview_buf, " cfg=0x{x} customer=\"{s}\"", .{ v.cfg_bits, cstr(&v.customer_name) }) catch "",
                 .bl_sec_key => |v| std.fmt.bufPrint(&preview_buf, " pad=0x{x}", .{v.pad_len}) catch "",
                 .emi_info => |v| std.fmt.bufPrint(&preview_buf, " emi_ver={d} flags=0x{x} magic=\"{s}\"{s}", .{
-                    v.version, v.flags, cstr(&v.magic), if (v.magic_ok) "" else " (魔数不符)",
+                    v.version, v.flags, cstr(&v.magic),
+                    if (v.magic_ok) "" else " (魔数不符)",
                 }) catch "",
                 // 工程名已经在 name 字段里出现，这里只补 body 里的版本串
                 .project_info => |v| std.fmt.bufPrint(&preview_buf, " version=\"{s}\"", .{cstr(&v.version_str)}) catch "",
@@ -144,8 +144,8 @@ pub fn dump(img: *const image.BootImage) void {
 
             log.info(@src(), "        gfh @0x{x:0>8} type=0x{x:0>4} ({s: <12}) size=0x{x:0>3} ver={d} {s}{s}{s}{s}", .{
                 e.offset,
-                e.@"type",
-                gfh.gfhTypeName(e.@"type"),
+                e.type,
+                fmt.gfhTypeName(e.type),
                 e.size,
                 e.version,
                 if (e.name[0] != 0) "name=\"" else "",

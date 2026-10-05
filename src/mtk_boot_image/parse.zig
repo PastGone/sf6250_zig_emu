@@ -3,8 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const boot_header = @import("boot_header.zig");
-const brlyt = @import("brlyt.zig");
+const fmt = @import("format.zig");
 const image = @import("image.zig");
 
 pub const ParseError = error{
@@ -40,23 +39,23 @@ pub fn loadFile(io: Io, allocator: std.mem.Allocator, path: []const u8) ParseErr
 pub fn parse(buf: []const u8, out: *image.BootImage) ParseError!void {
     out.* = .{};
 
-    if (buf.len < brlyt.offset + brlyt.min_size)
+    if (buf.len < fmt.brlyt_offset + fmt.brlyt_min_size)
         return ParseError.TooSmall;
 
     out.data = buf;
 
     // 1. 设备头
-    out.boot = boot_header.GenBootHeader.read(buf);
+    out.boot = fmt.GenBootHeader.read(buf);
     if (!out.boot.isValid()) return ParseError.BadBoot;
 
     // 2. BRLYT 布局头 + region 表
-    out.brlyt = brlyt.BromLayoutHeader.read(buf[brlyt.offset..]);
+    out.brlyt = fmt.BromLayoutHeader.read(buf[fmt.brlyt_offset..]);
     if (!out.brlyt.isValid()) return ParseError.BadBrlyt;
     out.brlyt_region_count = out.brlyt.usedRegions();
 
     // 3. BRLYT 指出的镜像（memory_view 槽位不是文件内偏移）
     for (out.brlyt.region) |rg| {
-        if (rg.magic != brlyt.brlyt_magic) continue;
+        if (rg.magic != fmt.brlyt_magic) continue;
         if (rg.kind() != .file_offset) continue;
         _ = image.imageAdd(out, rg.start);
     }
