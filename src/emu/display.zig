@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const log = @import("../log.zig");
-const c = @import("sdl_c.zig").c;
+const c = @import("c/sdl.zig").c;
 
 pub const Display = struct {
     window: ?*c.SDL_Window = null,

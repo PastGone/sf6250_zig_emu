@@ -79,12 +79,12 @@ fn buildUnicorn(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.R
     const is_windows = target.result.os.tag == .windows;
 
     // include 目录 = CMakeLists.txt:98-106（CMAKE_BINARY_DIR 上的 config-host.h
-    // 换成预生成的 src/emu/uc_config/，按目标 OS 选 host 侧那份）。
-    m.addIncludePath(b.path("src/emu/uc_config/common"));
+    // 换成预生成的 src/emu/c/uc_config/，按目标 OS 选 host 侧那份）。
+    m.addIncludePath(b.path("src/emu/c/uc_config/common"));
     const host_cfg: []const u8 = if (is_windows)
-        "src/emu/uc_config/windows"
+        "src/emu/c/uc_config/windows"
     else
-        "src/emu/uc_config/linux";
+        "src/emu/c/uc_config/linux";
     m.addIncludePath(b.path(host_cfg));
     m.addIncludePath(uc.path(b, "glib_compat"));
     m.addIncludePath(uc.path(b, "qemu"));

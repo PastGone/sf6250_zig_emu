@@ -5,7 +5,7 @@
 //! 其余保持 Unicorn 的原样语义。
 
 const std = @import("std");
-const c = @import("unicorn_c.zig").c;
+const c = @import("c/unicorn.zig").c;
 
 pub const Error = error{
     NoMemory,

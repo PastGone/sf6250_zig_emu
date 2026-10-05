@@ -15,7 +15,7 @@ MT6250（MTK 功能机 GSM/GPRS 基带 SoC）的模拟器：Zig 编写，CPU 用
 - Linux x86_64 / aarch64（已验证）
 - Windows x86_64：可在 Windows 上装 zig 直接 `zig build`，也可以在 Linux 上
   交叉编译（编译已验证；exe 在真机上的运行待验证）
-- macOS 暂不支持：缺 macOS 版 QEMU 配置头，见 `src/emu/uc_config/README.md`
+- macOS 暂不支持：缺 macOS 版 QEMU 配置头，见 `src/emu/c/uc_config/README.md`
 
 ## 构建与运行
 
@@ -55,7 +55,7 @@ zig build -Dtarget=x86_64-windows-gnu
 
 ```
 src/emu/            模拟器：unicorn C API 薄封装 / 机器骨架（内存映射 + 外设探针）/ SDL3 LCD
-src/emu/uc_config/  预生成的 QEMU 配置头（host 侧按 OS 选择，详见其中 README）
+src/emu/c/uc_config/  预生成的 QEMU 配置头（host 侧按 OS 选择，详见其中 README）
 src/mtk_boot_image/ MTK SF_BOOT 固件镜像解析（GFH / BRLYT / EMI_INFO…）
 vendor/unicorn/     unicorn 2.1.4 源码裁剪版（仅 ARM 客体，裁剪说明见 VENDORED.md）
 res/                测试固件（AHONG50 MT6250 整片 flash dump）
