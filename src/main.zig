@@ -65,13 +65,12 @@ pub fn main(init: std.process.Init) !void {
         log.err(@src(), "failed to map flash window (rc={s})", .{@errorName(err)});
         return;
     };
-    if (mach.lenient) {
-        mach.mapPeriphStubs() catch |err| {
-            log.err(@src(), "failed to map peripheral stubs (rc={s})", .{@errorName(err)});
-            return;
-        };
-    }
-    mach.run(20_000);
+    // 外设层常驻：已接线寄存器给行为，其余读 0/写丢弃并记名
+    mach.mapPeriphStubs() catch |err| {
+        log.err(@src(), "failed to map peripherals (rc={s})", .{@errorName(err)});
+        return;
+    };
+    mach.run(2_000_000);
 
     // 2. LCD：窗口 + 一帧占位画面；带 --lcd 时进入事件循环
     var disp = try emu.Display.init("MT6250", lcd_width, lcd_height, 2);

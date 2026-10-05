@@ -29,7 +29,39 @@ pub const map = struct {
     pub const ahb_size = 0x1000_0000;
 };
 
-const max_faults = 32;
+const max_faults = 256;
+
+/// 已接线的寄存器区块（地址→名字）。行为依据见 docs/mt6250-wiring.md。
+pub const known_regions = [_]struct { base: u32, name: []const u8 }{
+    .{ .base = 0xA005_0000, .name = "CLK/PLL" },
+    .{ .base = 0xA006_0000, .name = "UART1(AT)" },
+    .{ .base = 0xA007_0000, .name = "UART2" },
+    .{ .base = 0xA008_0000, .name = "UART3(LOG)" },
+    .{ .base = 0xA018_0000, .name = "EMI/总线命令" },
+    .{ .base = 0xA045_0000, .name = "LCM" },
+    .{ .base = 0xA073_0000, .name = "ACFG GPIO" },
+};
+
+fn regionName(addr: u32) ?[]const u8 {
+    for (known_regions) |r| {
+        if (addr >= r.base and addr < r.base + 0x1_0000) return r.name;
+    }
+    return null;
+}
+
+/// addr 落在哪个 UART 块（UART1/2/3 各 64KB 间隔）
+fn uartIndex(addr: u32) ?usize {
+    if (addr >= 0xA006_0000 and addr < 0xA009_0000) {
+        return (addr - 0xA006_0000) >> 16;
+    }
+    return null;
+}
+
+/// MMIO 回调的区域上下文：apb/ahb 两个区域共用回调，必须区分基址
+const RegionCtx = struct {
+    machine: *Machine,
+    base: u64,
+};
 
 pub const Machine = struct {
     allocator: std.mem.Allocator,
@@ -44,6 +76,11 @@ pub const Machine = struct {
 
     hook_code: c.uc_hook = 0,
     hook_mem: c.uc_hook = 0,
+
+    regions: [2]RegionCtx = undefined,
+    /// UART1/2/3 的行缓冲（固件串口输出，按 \n / \r / 满行刷新）
+    uart_line: [3][121]u8 = undefined,
+    uart_len: [3]usize = @splat(0),
 
     /// 去重后的未映射访问地址（用来反推外设分布）
     fault_addrs: [max_faults]u64 = @splat(0),
@@ -76,14 +113,17 @@ pub const Machine = struct {
         }));
     }
 
-    /// 把外设窗口整段挂成 MMIO 桩：读回 0、写丢弃，但把地址记下来。
-    /// 这是“黑盒推进”的抓手——先让固件跑起来，再按它真正访问的寄存器逐个实现。
+    /// 外设窗口挂成 MMIO：已接线的寄存器按 docs/mt6250-wiring.md 给行为，
+    /// 其余读 0/写丢弃并记名——这是「黑盒推进」的抓手。
     pub fn mapPeriphStubs(self: *Machine) !void {
-        try self.eng.mmioMap(map.ahb_base, map.ahb_size, onMmioRead, self, onMmioWrite, self);
-        try self.eng.mmioMap(map.apb_base, map.apb_size, onMmioRead, self, onMmioWrite, self);
-        log.info(@src(), "外设桩: 0x{x:0>8}..0x{x:0>8}, 0x{x:0>8}..0x{x:0>8}（读 0 / 写丢弃）", .{
-            map.ahb_base, map.ahb_base + map.ahb_size,
-            map.apb_base, map.apb_base + map.apb_size,
+        self.regions[0] = .{ .machine = self, .base = map.ahb_base };
+        self.regions[1] = .{ .machine = self, .base = map.apb_base };
+        try self.eng.mmioMap(map.ahb_base, map.ahb_size, onMmioRead, &self.regions[0], onMmioWrite, &self.regions[0]);
+        try self.eng.mmioMap(map.apb_base, map.apb_size, onMmioRead, &self.regions[1], onMmioWrite, &self.regions[1]);
+        log.info(@src(), "外设: 0x{x:0>8}..0x{x:0>8}, 0x{x:0>8}..0x{x:0>8}（{d} 个区块已接线，其余读 0/写丢弃）", .{
+            map.ahb_base,      map.ahb_base + map.ahb_size,
+            map.apb_base,      map.apb_base + map.apb_size,
+            known_regions.len,
         });
     }
 
@@ -142,7 +182,7 @@ pub const Machine = struct {
             });
         };
 
-        log.info(@src(), "执行 {d} 条指令", .{self.instrs});
+        log.info(@src(), "执行 {d} 条指令, 最终 pc=0x{x:0>8}", .{ self.instrs, self.readPc() catch 0 });
         self.reportFaults();
     }
 
@@ -173,21 +213,74 @@ pub const Machine = struct {
     }
 };
 
-fn onMmioRead(_: ?*c.uc_engine, offset: u64, size: c_uint, user: ?*anyopaque) callconv(.c) u64 {
-    const m: *Machine = @ptrCast(@alignCast(user));
-    const addr = map.ahb_base + offset;
-    if (m.recordFault(addr, "read")) {
-        log.info(@src(), "  外设桩读 @0x{x:0>8} size={d} -> 0", .{ addr, size });
+/// 固件串口输出：存进行缓冲，\n / \r / 满行时按行打出
+fn uartPutc(self: *Machine, i: usize, b: u8) void {
+    const printable = (b >= 0x20 and b < 0x7f) or b == '\t';
+    if (self.uart_len[i] < 120) {
+        self.uart_line[i][self.uart_len[i]] = if (printable) b else '?';
+        self.uart_len[i] += 1;
+    }
+    if (b == '\n' or b == '\r' or self.uart_len[i] >= 120) {
+        log.info(@src(), "[UART{d} TX] {s}", .{ i + 1, self.uart_line[i][0..self.uart_len[i]] });
+        self.uart_len[i] = 0;
+    }
+}
+
+/// 已接线寄存器的读行为；其余记录后读 0
+fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
+    // 时钟/PLL 状态：bit7=就绪、bit0=busy 清（BL 0x70008AAC 轮询的位）
+    if (addr == 0xA005_0090) return 0x80;
+    // EMI/总线命令状态：bit0=0（命令已完成，BL 0x70008FA8 轮询的位）
+    if (addr == 0xA018_00A0) return 0x00;
+
+    if (uartIndex(addr) != null) {
+        const off = addr & 0xFFFF;
+        if (off == 0x14) return 0x60; // LSR：THRE|TEMT（发送器空闲）
+        if (off == 0x00) return 0x00; // RBR：无接收数据
+    }
+
+    if (self.recordFault(addr, "read")) {
+        if (regionName(addr)) |n| {
+            log.info(@src(), "  外设读 {s}+0x{x:0>4} size={d} -> 0（未接线）", .{ n, addr & 0xFFFF, size });
+        } else {
+            log.info(@src(), "  外设桩读 @0x{x:0>8} size={d} -> 0", .{ addr, size });
+        }
     }
     return 0;
 }
 
-fn onMmioWrite(_: ?*c.uc_engine, offset: u64, size: c_uint, value: u64, user: ?*anyopaque) callconv(.c) void {
-    const m: *Machine = @ptrCast(@alignCast(user));
-    const addr = map.ahb_base + offset;
-    if (m.recordFault(addr, "write")) {
-        log.info(@src(), "  外设桩写 @0x{x:0>8} size={d} value=0x{x}", .{ addr, size, value });
+/// 已接线寄存器的写行为；其余记录后丢弃
+fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
+    if (uartIndex(addr)) |i| {
+        if (addr & 0xFFFF == 0x0000) { // THR：固件串口发送
+            uartPutc(self, i, @truncate(value));
+            return;
+        }
     }
+    if (addr == 0xA018_00A0) { // EMI/总线命令：busy 位写后自清
+        if (self.recordFault(addr, "emi-cmd")) {
+            log.info(@src(), "  EMI 总线命令 write 0x{x}（busy 自清）", .{value});
+        }
+        return;
+    }
+
+    if (self.recordFault(addr, "write")) {
+        if (regionName(addr)) |n| {
+            log.info(@src(), "  外设写 {s}+0x{x:0>4} size={d} value=0x{x}", .{ n, addr & 0xFFFF, size, value });
+        } else {
+            log.info(@src(), "  外设桩写 @0x{x:0>8} size={d} value=0x{x}", .{ addr, size, value });
+        }
+    }
+}
+
+fn onMmioRead(_: ?*c.uc_engine, offset: u64, size: c_uint, user: ?*anyopaque) callconv(.c) u64 {
+    const ctx: *RegionCtx = @ptrCast(@alignCast(user.?));
+    return periphRead(ctx.machine, @truncate(ctx.base + offset), size);
+}
+
+fn onMmioWrite(_: ?*c.uc_engine, offset: u64, size: c_uint, value: u64, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *RegionCtx = @ptrCast(@alignCast(user.?));
+    periphWrite(ctx.machine, @truncate(ctx.base + offset), size, value);
 }
 
 fn onCode(_: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) callconv(.c) void {
@@ -223,6 +316,16 @@ fn onMemInvalid(
     _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_PC, &pc);
 
     if (m.lenient) {
+        // 读写未映射：自动映射所在 4KB 页（RW，内容为 0）再放行——探针框架
+        // 的能力，让容量探测/预分配式访问自然通过。取指未映射无法放行。
+        switch (typ) {
+            c.UC_MEM_READ_UNMAPPED, c.UC_MEM_WRITE_UNMAPPED => {
+                const page = address & ~@as(u64, 0xFFF);
+                const rw: u32 = c.UC_PROT_READ | c.UC_PROT_WRITE;
+                m.eng.memMap(page, 0x1000, rw) catch {}; // 已映射则忽略
+            },
+            else => {},
+        }
         log.debug(@src(), "{s} @0x{x:0>8} size={d} pc=0x{x:0>8} (宽容放行)", .{
             kind, address, size, pc,
         });
