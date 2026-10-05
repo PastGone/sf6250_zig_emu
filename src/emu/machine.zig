@@ -109,7 +109,7 @@ pub const Machine = struct {
     clk_cmd: u32 = 0,
 
     /// 末尾执行轨迹（诊断用：看停机/空转前在跑什么）
-    exec_hist: [256]u32 = @splat(0),
+    exec_hist: [1024]u32 = @splat(0),
     exec_hist_pos: usize = 0,
 
     /// 去重后的未映射访问地址（用来反推外设分布）
@@ -135,6 +135,8 @@ pub const Machine = struct {
         try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x0, 0xFFFF, onLowRamWrite, m);
         // 监视服务表+服务代码写入：谁改写了我们登记的服务指针/代码
         try m.eng.hookMem(&m.hook_svcwr, c.UC_HOOK_MEM_WRITE, bootrom_svc_table, bootrom_svc_code + 0x20, onSvcTableWrite, m);
+        // 监视 init_dispatch 代码区写入：确认是否有代码被运行时改写
+        try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x7000_82E0, 0x7000_8340, onLowRamWrite, m);
         return m;
     }
 
@@ -248,8 +250,11 @@ pub const Machine = struct {
         if (code.len == 0) return error.EmptyBootloader;
 
         try self.mapSram();
-        // FILE_INFO 头不在 load_addr 处的内容里：正文从 load_addr + hdr_size 开始
-        try self.eng.memWrite(bl.load_addr + bl.hdr_size, code);
+        // 整个镜像区（GFH 头链 + 载荷）一起装载——真机 BootROM 拷全镜像，
+        // BL 的记录查找器（sub_70008C10 → sub_700095d8）会在 SRAM 的
+        // 头副本里按 GFH type 找 FILE_INFO/ANTI_CLONE 等记录
+        const whole = img.data[bl.offset..][0..bl.total_size];
+        try self.eng.memWrite(bl.load_addr, whole);
         self.img = img;
 
         const pc: u32 = bl.load_addr +% bl.jump_offset;
@@ -278,13 +283,34 @@ pub const Machine = struct {
         const begin = self.readPc() catch 0;
         self.instrs = 0;
 
-        self.eng.emuStart(begin, 0, 0, budget) catch |err| {
+        // until 不能用 0：BL 会合法跳到 0x0 调用 BootROM 安装的 RAM 函数，
+        // until=0 会在执行前拦截它
+        self.eng.emuStart(begin, 0xFFFF_FFF0, 0, budget) catch |err| {
             log.warn(@src(), "CPU 停止: {s} ({d} 条指令), pc=0x{x:0>8}", .{
                 uc.Engine.strerror(err), self.instrs, self.readPc() catch 0,
             });
         };
 
         log.info(@src(), "执行 {d} 条指令, 最终 pc=0x{x:0>8}", .{ self.instrs, self.readPc() catch 0 });
+    {
+        var cpsr: u32 = 0;
+        var sp: u32 = 0;
+        _ = self.eng.regRead(c.UC_ARM_REG_CPSR, &cpsr) catch {};
+        _ = self.eng.regRead(c.UC_ARM_REG_SP, &sp) catch {};
+        log.info(@src(), "停止现场: cpsr=0x{x:0>8} (T={d}, mode=0x{x}) sp=0x{x:0>8}", .{
+            cpsr, (cpsr >> 5) & 1, cpsr & 0x1F, sp,
+        });
+        var mem: [0x80]u8 = undefined;
+        if (c.uc_mem_read(self.eng.handle, 0x7000_82C0, &mem, mem.len) == c.UC_ERR_OK) {
+            var hx: [3 * 0x80]u8 = undefined;
+            var n: usize = 0;
+            for (mem) |b| {
+                const p = std.fmt.bufPrint(hx[n..], "{x:0>2} ", .{b}) catch break;
+                n += p.len;
+            }
+            log.info(@src(), "STOPMEM 0x700082c0: {s}", .{hx[0..n]});
+        }
+    }
         self.dumpExecHist();
         self.reportFaults();
     }
@@ -299,7 +325,7 @@ pub const Machine = struct {
     fn dumpExecHist(self: *const Machine) void {
         const n = @min(self.exec_hist_pos, self.exec_hist.len);
         if (n == 0) return;
-        var buf: [256 * 10]u8 = undefined;
+        var buf: [1024 * 10]u8 = undefined;
         var len: usize = 0;
         var i: usize = 0;
         const start = if (self.exec_hist_pos > n) self.exec_hist_pos % n else 0;
@@ -417,7 +443,13 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
             self.eng.memMap(map.boot_view_base, map.boot_view_ram_size, uc.Perm.combine(&.{
                 .read, .write, .exec,
             })) catch {};
-            log.info(@src(), "  EMI 重映射: 0x{x:0>8} NOR 视图 → {d}MB 可写 RAM", .{
+            // BootROM 安装的 RAM 函数（ARM: mov r0,#0; bx lr）——BL 重映射后
+            // 会跳到 0x0 调用它（实机行为：BootROM 在低 RAM 装内核函数）
+            self.eng.memWrite(map.boot_view_base, &.{
+                0x00, 0x00, 0xA0, 0xE3, // mov r0, #0
+                0x1E, 0xFF, 0x2F, 0xE1, // bx lr
+            }) catch {};
+            log.info(@src(), "  EMI 重映射: 0x{x:0>8} NOR 视图 → {d}MB 可写 RAM + BootROM RAM 函数", .{
                 map.boot_view_base, map.boot_view_ram_size >> 20,
             });
         }
@@ -539,6 +571,14 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
             address, lr, r0, r1r, m.instrs,
         });
         m.dumpExecHist();
+    }
+    if (address == 0x7000_844a and !m.bp_logged) {
+        m.bp_logged = true;
+        var r7: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R7, &r7);
+        var buf: [16]u8 = @splat(0);
+        _ = c.uc_mem_read(engine, r7, &buf, buf.len);
+        log.info(@src(), "  [BRLYT校验] r7=0x{x:0>8} 内容={s} (strcmp 结果 r0)", .{ r7, buf });
     }
     if (address == 0x10008061) {
         log.info(@src(), "★ 阶段切换: 进入 BL2 (0x10008061)", .{});
@@ -662,9 +702,15 @@ fn onMemInvalid(
             },
             else => {},
         }
-        log.debug(@src(), "{s} @0x{x:0>8} size={d} pc=0x{x:0>8} (宽容放行)", .{
-            kind, address, size, pc,
-        });
+        if (typ == c.UC_MEM_FETCH_UNMAPPED or typ == c.UC_MEM_FETCH_PROT) {
+            log.info(@src(), "  [取指失败] {s} 目标=0x{x:0>8} pc=0x{x:0>8} ← 跳转指令在此", .{
+                kind, address, pc,
+            });
+        } else {
+            log.debug(@src(), "{s} @0x{x:0>8} size={d} pc=0x{x:0>8} (宽容放行)", .{
+                kind, address, size, pc,
+            });
+        }
         return true;
     }
 
