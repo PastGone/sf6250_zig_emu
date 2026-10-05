@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         log.err(@src(), "failed to map peripherals (rc={s})", .{@errorName(err)});
         return;
     };
-    mach.run(20_000_000);
+    mach.run(budgetArg(args));
 
     // 2. LCD：窗口 + 一帧占位画面；带 --lcd 时进入事件循环
     var disp = try emu.Display.init("MT6250", lcd_width, lcd_height, 2);
@@ -100,4 +100,16 @@ fn firstPositional(args: []const []const u8) ?[]const u8 {
         if (!std.mem.startsWith(u8, a, "--")) return a;
     }
     return null;
+}
+
+/// `--budget=N`：指令预算（十进制或 0x 十六进制），默认 100M。
+/// 推进启动链时按需缩短，用来快速定位「先撞上谁」。
+fn budgetArg(args: []const []const u8) u64 {
+    for (args) |a| {
+        if (std.mem.startsWith(u8, a, "--budget=")) {
+            const v = a["--budget=".len..];
+            return std.fmt.parseInt(u64, v, 0) catch 100_000_000;
+        }
+    }
+    return 100_000_000;
 }

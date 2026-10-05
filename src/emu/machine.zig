@@ -46,8 +46,10 @@ pub const known_regions = [_]struct { base: u32, name: []const u8 }{
     .{ .base = 0xA006_0000, .name = "UART1(AT)" },
     .{ .base = 0xA007_0000, .name = "UART2" },
     .{ .base = 0xA008_0000, .name = "UART3(LOG)" },
+    .{ .base = 0xA014_0000, .name = "SF(串行flash)" },
     .{ .base = 0xA018_0000, .name = "EMI/总线命令" },
     .{ .base = 0xA045_0000, .name = "LCM" },
+    .{ .base = 0xA071_0000, .name = "RTC" },
     .{ .base = 0xA073_0000, .name = "ACFG GPIO" },
 };
 
@@ -101,6 +103,10 @@ pub const Machine = struct {
     last_r10: u32 = 0,
     wild_jumped: bool = false,
     stack_exec: bool = false,
+    flash_entered: bool = false,
+    /// 进入 BL2 入口 / init_dispatch 的次数（判断「阶段交接」还是「重启循环」）
+    bl2_entries: u32 = 0,
+    init_entries: u32 = 0,
 
     regions: [2]RegionCtx = undefined,
     /// UART1/2/3 的行缓冲（固件串口输出，按 \n / \r / 满行刷新）
@@ -108,6 +114,32 @@ pub const Machine = struct {
     uart_len: [3]usize = @splat(0),
     /// 0xA0050090 时钟切换命令寄存器的当前命令（写后状态位按命令应答）
     clk_cmd: u32 = 0,
+
+    // ── 串行 flash 控制器（SF，0xA0140000）──────────────────────────────
+    // 依据：BL2 的 flash 识别流程（XIP 0x1000a8b4 → 0x1000d968 → 0x1000d890）。
+    // 固件把「命令字节」写进数据窗口 0xA0140800，长度写 +0x10，**读回字节数**写
+    // +0x14（不是命令！0x1000d8c2 存的是第 4 个参数），随后写 0xA0140000
+    // bit2|bit3 启动，轮询 bit1=完成、bit0=空闲。
+    /// +0x00 控制/状态（bit2|bit3 同时置位 = 命令完成，bit0 = 忙）
+    sfc_ctrl: u32 = 0,
+    /// +0x04 状态位（bit0 参与固件对 +0x00 bit4 的判定）
+    sfc_flags: u32 = 0,
+    /// +0x10 写进数据窗口的命令字节数（命令 + 地址）
+    sfc_len: u32 = 0,
+    /// +0x14 命令后要读回的响应字节数
+    sfc_mode: u32 = 0,
+    /// +0x800 起 4 字节数据窗口：[0..len) = 命令/地址，[len..) = 响应
+    sfc_fifo: [4]u8 = @splat(0),
+    /// 已执行的 SF 命令数（日志限流用）
+    sfc_cmds_run: u32 = 0,
+    /// 各命令字节的累计次数（run 结束打印，看 BL2 到底在干什么）
+    sfc_op_counts: [256]u32 = @splat(0),
+
+    // ── RTC（0xA0710000）────────────────────────────────────────────────
+    // 依据：《MT6250 数据手册》RTC 章 + BL 0x70008f00 的初始化序列。
+    // 寄存器文件语义 = 写入值读回（固件每写一个值就轮询读回比对）。
+    /// RTC 寄存器堆（0x00~0xFF，16 位寄存器，冷启动全 0）
+    rtc_regs: [0x100]u8 = @splat(0),
 
     /// 末尾执行轨迹（诊断用：看停机/空转前在跑什么）
     exec_hist: [1024]u32 = @splat(0),
@@ -298,33 +330,66 @@ pub const Machine = struct {
         };
 
         log.info(@src(), "执行 {d} 条指令, 最终 pc=0x{x:0>8}", .{ self.instrs, self.readPc() catch 0 });
-    {
-        var cpsr: u32 = 0;
-        var sp: u32 = 0;
-        _ = self.eng.regRead(c.UC_ARM_REG_CPSR, &cpsr) catch {};
-        _ = self.eng.regRead(c.UC_ARM_REG_SP, &sp) catch {};
-        log.info(@src(), "停止现场: cpsr=0x{x:0>8} (T={d}, mode=0x{x}) sp=0x{x:0>8}", .{
-            cpsr, (cpsr >> 5) & 1, cpsr & 0x1F, sp,
-        });
-        var mem: [0x80]u8 = undefined;
-        if (c.uc_mem_read(self.eng.handle, 0x7000_82C0, &mem, mem.len) == c.UC_ERR_OK) {
-            var hx: [3 * 0x80]u8 = undefined;
-            var n: usize = 0;
-            for (mem) |b| {
-                const p = std.fmt.bufPrint(hx[n..], "{x:0>2} ", .{b}) catch break;
-                n += p.len;
+        {
+            var cpsr: u32 = 0;
+            var sp: u32 = 0;
+            _ = self.eng.regRead(c.UC_ARM_REG_CPSR, &cpsr) catch {};
+            _ = self.eng.regRead(c.UC_ARM_REG_SP, &sp) catch {};
+            log.info(@src(), "停止现场: cpsr=0x{x:0>8} (T={d}, mode=0x{x}) sp=0x{x:0>8}", .{
+                cpsr, (cpsr >> 5) & 1, cpsr & 0x1F, sp,
+            });
+            var mem: [0x80]u8 = undefined;
+            if (c.uc_mem_read(self.eng.handle, 0x7000_82C0, &mem, mem.len) == c.UC_ERR_OK) {
+                var hx: [3 * 0x80]u8 = undefined;
+                var n: usize = 0;
+                for (mem) |b| {
+                    const p = std.fmt.bufPrint(hx[n..], "{x:0>2} ", .{b}) catch break;
+                    n += p.len;
+                }
+                log.info(@src(), "STOPMEM 0x700082c0: {s}", .{hx[0..n]});
             }
-            log.info(@src(), "STOPMEM 0x700082c0: {s}", .{hx[0..n]});
+            // 运行时低 SRAM：BL 会把 ExtBL 装载器/拷贝来的例程放在 0x70004000 区，
+            // 停机时 dump 出来才能离线反汇编（静态镜像里没有这段）
+            self.dumpMem(0x7000_4B80);
+            self.dumpMem(0x7000_4D00);
         }
-    }
         self.dumpExecHist();
         self.reportFaults();
+        self.reportSfcOps();
+    }
+
+    /// SF 命令直方图：BL2 阶段靠它判断「在读还是在写、是不是写-校验死循环」
+    fn reportSfcOps(self: *const Machine) void {
+        var total: u64 = 0;
+        for (self.sfc_op_counts) |n| total += n;
+        if (total == 0) return;
+        var buf: [512]u8 = undefined;
+        var len: usize = 0;
+        for (self.sfc_op_counts, 0..) |n, op| {
+            if (n == 0) continue;
+            const p = std.fmt.bufPrint(buf[len..], "{x:0>2}:{d} ", .{ op, n }) catch break;
+            len += p.len;
+        }
+        log.info(@src(), "SF 命令直方图（共 {d} 条）: {s}", .{ total, buf[0..len] });
     }
 
     pub fn readPc(self: *const Machine) !u32 {
         var v: u32 = 0;
         try self.eng.regRead(c.UC_ARM_REG_PC, &v);
         return v;
+    }
+
+    /// 运行时内存 hex dump（离线反汇编用）：0x100 字节一段
+    fn dumpMem(self: *const Machine, base: u32) void {
+        var mem: [0x100]u8 = undefined;
+        if (c.uc_mem_read(self.eng.handle, base, &mem, mem.len) != c.UC_ERR_OK) return;
+        var hx: [3 * 0x100]u8 = undefined;
+        var n: usize = 0;
+        for (mem) |b| {
+            const p = std.fmt.bufPrint(hx[n..], "{x:0>2}", .{b}) catch break;
+            n += p.len;
+        }
+        log.info(@src(), "RUNTIMEMEM:{x:0>8}:{s}", .{ base, hx[0..n] });
     }
 
     /// 末尾执行轨迹：按时间顺序打印最近的 PC（诊断空转/停机原因）
@@ -404,6 +469,14 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     if (addr == 0xA005_0318) return 0x2;
     // EMI/总线命令状态：bit0=0（命令已完成，BL 0x70008FA8 轮询的位）
     if (addr == 0xA018_00A0) return 0x00;
+    // 串行 flash 控制器（SF，0xA0140000）：控制/状态 + 数据窗口两个区段
+    if ((addr >= 0xA014_0000 and addr < 0xA014_0100) or (addr >= 0xA014_0800 and addr < 0xA014_0810)) {
+        return sfcRead(self, addr - 0xA014_0000, size);
+    }
+    // RTC（0xA0710000）：寄存器文件，写入值读回（数据手册 RTC 章）
+    if (addr >= 0xA071_0000 and addr < 0xA071_0100) {
+        return leRead(self.rtc_regs[0..], addr - 0xA071_0000, size);
+    }
 
     if (uartIndex(addr) != null) {
         const off = addr & 0xFFFF;
@@ -412,13 +485,123 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     }
 
     if (self.recordFault(addr, "read")) {
+        const site = accessSite(self);
         if (regionName(addr)) |n| {
-            log.info(@src(), "  外设读 {s}+0x{x:0>4} size={d} -> 0（未接线）", .{ n, addr & 0xFFFF, size });
+            log.info(@src(), "  外设读 {s}+0x{x:0>4} size={d} -> 0（未接线）pc=0x{x:0>8} lr=0x{x:0>8}", .{ n, addr & 0xFFFF, size, site.pc, site.lr });
         } else {
-            log.info(@src(), "  外设桩读 @0x{x:0>8} size={d} -> 0", .{ addr, size });
+            log.info(@src(), "  外设桩读 @0x{x:0>8} size={d} pc=0x{x:0>8} lr=0x{x:0>8}", .{ addr, size, site.pc, site.lr });
         }
     }
     return 0;
+}
+
+/// 触发访问的现场（pc/lr）：未接线外设的「谁在访问」必须能直接回答，
+/// 否则只能靠猜。第一次见到某地址时记录。
+fn accessSite(self: *Machine) struct { pc: u32, lr: u32 } {
+    var pc: u32 = 0;
+    var lr: u32 = 0;
+    _ = c.uc_reg_read(self.eng.handle, c.UC_ARM_REG_PC, &pc);
+    _ = c.uc_reg_read(self.eng.handle, c.UC_ARM_REG_LR, &lr);
+    return .{ .pc = pc, .lr = lr };
+}
+
+/// 小端读：字节缓冲 off 起 size 字节（外设寄存器宽度 1/2/4）
+fn leRead(buf: []const u8, off: u32, size: u32) u64 {
+    var v: u64 = 0;
+    var i: u32 = 0;
+    while (i < size) : (i += 1) {
+        const a = off + i;
+        if (a >= buf.len) break;
+        v |= @as(u64, buf[a]) << @intCast(8 * i);
+    }
+    return v;
+}
+
+/// 小端写：把 value 的低 size 字节写进缓冲
+fn leWrite(buf: []u8, off: u32, size: u32, value: u64) void {
+    var i: u32 = 0;
+    while (i < size) : (i += 1) {
+        const a = off + i;
+        if (a >= buf.len) break;
+        buf[a] = @truncate(value >> @intCast(8 * i));
+    }
+}
+
+/// SF（串行 flash）控制器寄存器读。位语义由固件轮询序列反推：
+///   +0x00 bit0=忙（本模型恒 0）、bit1=命令完成（= bit2&bit3 同时为 1）、
+///         bit2/bit3/bit4=固件写的控制位（回读保留）
+///   +0x04 状态标志、+0x10 命令字节数、+0x14 响应字节数、+0x800 起数据窗口
+fn sfcRead(self: *Machine, off: u32, size: u32) u64 {
+    if (off == 0x00) {
+        const done: u32 = if (self.sfc_ctrl & 0xC == 0xC) 0x2 else 0;
+        return (self.sfc_ctrl & ~@as(u32, 0x3)) | done;
+    }
+    if (off == 0x04) return self.sfc_flags;
+    if (off == 0x10) return self.sfc_len;
+    if (off == 0x14) return self.sfc_mode;
+    if (off >= 0x800 and off < 0x804) return leRead(self.sfc_fifo[0..], off - 0x800, size);
+    return 0;
+}
+
+fn sfcWrite(self: *Machine, off: u32, size: u32, value: u64) void {
+    if (off == 0x00) {
+        self.sfc_ctrl = @truncate(value);
+        // bit2|bit3 同时置位 = 固件启动一次命令（XIP 0x1000d702：先置 bit3，再置 bit2）
+        if (self.sfc_ctrl & 0xC == 0xC) sfcExec(self);
+        return;
+    }
+    if (off == 0x04) {
+        self.sfc_flags = @truncate(value);
+        return;
+    }
+    if (off == 0x10) {
+        self.sfc_len = @truncate(value);
+        return;
+    }
+    if (off == 0x14) {
+        self.sfc_mode = @truncate(value);
+        return;
+    }
+    if (off >= 0x800 and off < 0x804) {
+        leWrite(self.sfc_fifo[0..], off - 0x800, size, value);
+        return;
+    }
+}
+
+/// 执行一次 SF 命令并填响应。命令字节 = 数据窗口第 0 字节（固件就是这么写的），
+/// 响应放在 [len] 之后——固件读回的位置是 0xA0140800 + len
+/// （XIP 0x1000d8ce：r1 = 0xA0140800 + len，再逐字节拷进目标缓冲）。
+/// 已实证的命令：
+///   0xAF 读电子 ID → 0，固件据此回退去发 0x9F（XIP 0x1000d98e）
+///   0x9F JEDEC RDID → 固件自带支持表（XIP 0x1000ca2c）第一项 2c cb 18
+///   0x05 RDSR / 0x70 RFSR → 状态轮询（XIP 0x1000a5da 的等待循环）
+fn sfcExec(self: *Machine) void {
+    const op: u8 = self.sfc_fifo[0];
+    const resp: []const u8 = switch (op) {
+        0x9F => &[_]u8{ 0x2C, 0xCB, 0x18 },
+        0xAF => &[_]u8{0x00},
+        // RDSR：空闲 NOR 的 WIP=0、错误位全 0
+        0x05 => &[_]u8{0x00},
+        // RFSR（Micron 专有）：bit7=1 表示 P/E 控制器就绪，其余是错误位
+        0x70 => &[_]u8{0x80},
+        // 其余（WREN/擦除/编程等）当前不建模，返回 0xFF = 无响应
+        else => &[_]u8{ 0xFF, 0xFF, 0xFF },
+    };
+    const base: u32 = self.sfc_len; // 响应紧跟在命令/地址字节之后
+    for (resp, 0..) |b, i| {
+        const a = base + i;
+        if (a < self.sfc_fifo.len) self.sfc_fifo[a] = b;
+    }
+    if (self.sfc_op_counts[op] == 0) {
+        const site = accessSite(self);
+        log.info(@src(), "  [SF] 命令 0x{x:0>2} 首次: 写 {d} 字节 读 {d} 字节 fifo={x:0>2} {x:0>2} {x:0>2} {x:0>2} pc=0x{x:0>8} lr=0x{x:0>8}", .{
+            op,               self.sfc_len,     self.sfc_mode,
+            self.sfc_fifo[0], self.sfc_fifo[1], self.sfc_fifo[2],
+            self.sfc_fifo[3], site.pc,          site.lr,
+        });
+    }
+    self.sfc_cmds_run += 1;
+    self.sfc_op_counts[op] += 1;
 }
 
 /// 已接线寄存器的写行为；其余记录后丢弃
@@ -461,12 +644,22 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         }
         return;
     }
+    // 串行 flash 控制器（SF）与 RTC 的写侧
+    if ((addr >= 0xA014_0000 and addr < 0xA014_0100) or (addr >= 0xA014_0800 and addr < 0xA014_0810)) {
+        sfcWrite(self, addr - 0xA014_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA071_0000 and addr < 0xA071_0100) {
+        leWrite(self.rtc_regs[0..], addr - 0xA071_0000, size, value);
+        return;
+    }
 
     if (self.recordFault(addr, "write")) {
+        const site = accessSite(self);
         if (regionName(addr)) |n| {
-            log.info(@src(), "  外设写 {s}+0x{x:0>4} size={d} value=0x{x}", .{ n, addr & 0xFFFF, size, value });
+            log.info(@src(), "  外设写 {s}+0x{x:0>4} size={d} value=0x{x} pc=0x{x:0>8} lr=0x{x:0>8}", .{ n, addr & 0xFFFF, size, value, site.pc, site.lr });
         } else {
-            log.info(@src(), "  外设桩写 @0x{x:0>8} size={d} value=0x{x}", .{ addr, size, value });
+            log.info(@src(), "  外设桩写 @0x{x:0>8} size={d} value=0x{x} pc=0x{x:0>8} lr=0x{x:0>8}", .{ addr, size, value, site.pc, site.lr });
         }
     }
 }
@@ -588,11 +781,35 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         _ = c.uc_mem_read(engine, r7, &buf, buf.len);
         log.info(@src(), "  [BRLYT校验] 全局[0x7000a0e4]=0x{x:0>8} r7=基址+0x208=0x{x:0>8} 内容={s}", .{ base, r7, buf });
     }
-    if (address == 0x10008061) {
-        log.info(@src(), "★ 阶段切换: 进入 BL2 (0x10008061)", .{});
+    // 阶段入口：hook 报的是取指地址。Thumb 入口的 bit0 不在取指地址里，
+    // 所以 0x10008061（镜像里的 Thumb 入口）实际表现为 0x10008060。
+    if (address == 0x1000_8060) {
+        m.bl2_entries += 1;
+        if (m.bl2_entries <= 8 or m.bl2_entries % 64 == 0) {
+            log.info(@src(), "★ 阶段切换: 进入 BL2 #{d} (0x10008061, 取指 0x10008060) instrs={d}", .{
+                m.bl2_entries, m.instrs,
+            });
+        }
     }
-    if (address == 0x10020301) {
-        log.info(@src(), "★ 阶段切换: 进入 MAUI (0x10020301)", .{});
+    // 第一次在 flash/XIP 窗口执行：确认「谁在什么时候开始跑 flash 里的代码」
+    if (address >= 0x1000_0000 and address < 0x1100_0000 and !m.flash_entered) {
+        m.flash_entered = true;
+        var lr: u32 = 0;
+        var sp: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_SP, &sp);
+        log.info(@src(), "  [flash 执行] 首次在 XIP 窗口取指 pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} (instrs={d})", .{
+            address, lr, sp, m.instrs,
+        });
+    }
+    if (address == 0x1002_0300) {
+        log.info(@src(), "★ 阶段切换: 进入 MAUI (0x10020301, 取指 0x10020300)", .{});
+    }
+    if (address == 0x700082e0) {
+        m.init_entries += 1;
+        if (m.init_entries <= 8 or m.init_entries % 64 == 0) {
+            log.info(@src(), "  [init_dispatch] 第 {d} 次进入 instrs={d}", .{ m.init_entries, m.instrs });
+        }
     }
     if (address == 0x700082e0 and !m.bp_logged) {
         m.bp_logged = true;
