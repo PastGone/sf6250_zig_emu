@@ -79,6 +79,7 @@ pub const Machine = struct {
     hook_tblwr: c.uc_hook = 0,
     tbl_wr: u32 = 0,
     bp_logged: bool = false,
+    bp_bss: bool = false,
 
     regions: [2]RegionCtx = undefined,
     /// UART1/2/3 的行缓冲（固件串口输出，按 \n / \r / 满行刷新）
@@ -88,7 +89,7 @@ pub const Machine = struct {
     clk_cmd: u32 = 0,
 
     /// 末尾执行轨迹（诊断用：看停机/空转前在跑什么）
-    exec_hist: [64]u32 = @splat(0),
+    exec_hist: [256]u32 = @splat(0),
     exec_hist_pos: usize = 0,
 
     /// 去重后的未映射访问地址（用来反推外设分布）
@@ -209,7 +210,7 @@ pub const Machine = struct {
     fn dumpExecHist(self: *const Machine) void {
         const n = @min(self.exec_hist_pos, self.exec_hist.len);
         if (n == 0) return;
-        var buf: [64 * 10]u8 = undefined;
+        var buf: [256 * 10]u8 = undefined;
         var len: usize = 0;
         var i: usize = 0;
         const start = if (self.exec_hist_pos > n) self.exec_hist_pos % n else 0;
@@ -345,6 +346,18 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
     m.instrs += 1;
     m.exec_hist[m.exec_hist_pos % m.exec_hist.len] = @truncate(address);
     m.exec_hist_pos += 1;
+    if (address == 0x70009b20 and !m.bp_bss) {
+        m.bp_bss = true;
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        var r2: u32 = 0;
+        var r3: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R2, &r2);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R3, &r3);
+        log.info(@src(), "  [断点] 0x70009b20 BSS清理: r0=0x{x:0>8} r1=0x{x:0>8} r2=0x{x:0>8} r3=0x{x:0>8}", .{ r0, r1, r2, r3 });
+    }
     if (address == 0x10008061) {
         log.info(@src(), "★ 阶段切换: 进入 BL2 (0x10008061)", .{});
     }
@@ -361,6 +374,19 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
         log.info(@src(), "  [断点] 0x700082e0 入口: r0=0x{x:0>8} r1=0x{x:0>8} lr=0x{x:0>8}", .{ r0, r1, lr });
         m.dumpExecHist();
+        // 导出运行时 SRAM hex，供离线反汇编（蹦床 + 传参处两段）
+        inline for (.{ 0x70009900, 0x70008200, 0x70009A80 }) |base| {
+            var mem: [0x100]u8 = undefined;
+            if (c.uc_mem_read(engine, base, &mem, mem.len) == c.UC_ERR_OK) {
+                var hx: [3 * 0x100]u8 = undefined;
+                var n: usize = 0;
+                for (mem) |b| {
+                    const p = std.fmt.bufPrint(hx[n..], "{x:0>2}", .{b}) catch break;
+                    n += p.len;
+                }
+                log.info(@src(), "RUNTIMESRAM:{x:0>8}:{s}", .{ base, hx[0..n] });
+            }
+        }
     }
     if (m.trace) {
         log.debug(@src(), "pc=0x{x:0>8} size={d}", .{ address, size });
