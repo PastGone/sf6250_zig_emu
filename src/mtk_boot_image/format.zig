@@ -378,6 +378,20 @@ pub fn brlytRegionIndex(t: u32) u16 {
     return @truncate(t >> 16);
 }
 
+/// 槽位 type 若命中官方媒体枚举（BrlytImgType），返回其 flash 编号（低 16 位）。
+/// 真机固件的槽位 type 多为 (index<<16)|flash 形式，只有媒体槽位会命中；
+/// 用于 FILE_INFO.flash_type 的交叉验证（mtk_image.c verify_gfh 的思路）。
+pub fn brlytMediaFlash(t: u32) ?u8 {
+    return switch (t) {
+        @intFromEnum(BrlytImgType.nand) => @truncate(t),
+        @intFromEnum(BrlytImgType.emmc) => @truncate(t),
+        @intFromEnum(BrlytImgType.nor) => @truncate(t),
+        @intFromEnum(BrlytImgType.sdmmc) => @truncate(t),
+        @intFromEnum(BrlytImgType.snand) => @truncate(t),
+        else => null,
+    };
+}
+
 pub fn brlytRegionFlash(t: u32) u16 {
     return @truncate(t);
 }

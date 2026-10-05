@@ -1,5 +1,7 @@
 //! 镜像表：解析结果的数据结构，以及 BRLYT / 全文件扫描两个登记入口。
 
+const std = @import("std");
+
 const bytes = @import("bytes.zig");
 const fixedStr = bytes.fixedStr;
 const crc32 = bytes.crc32;
@@ -24,18 +26,40 @@ pub const GfhEntry = struct {
     body: fmt.GfhBody = .empty,
 };
 
+/// sig_type == sha256 时按 U-Boot 生成器布局（mtk_image.c put_hash）的校验结果。
+/// 真机工具的签名布局可能与 U-Boot 不同，不匹配只报告、不当硬错误。
+pub const SigSha256 = enum { none, ok, mismatch };
+
 /// 完整性/一致性检查的结果。任何一项为真都应该在 dump 里用 warn 报出来。
 pub const Integrity = struct {
-    sig_unverified: bool = false, // sig_type != NONE，但本工具未做签名验证
+    sig_unverified: bool = false, // sig_type != NONE（镜像带签名；结果见 sig_sha256）
     bad_hdr_size: bool = false, // hdr_size > total_size
     sig_overlap: bool = false, // hdr_size + sig_size > total_size
     gfh_chain_mismatch: bool = false, // GFH 链终点 != offset + hdr_size
     gfh_truncated: bool = false, // GFH 数组溢出或未走到 hdr_size
+    flash_type_mismatch: bool = false, // FILE_INFO.flash_type 与 BRLYT 媒体类型不符
+    sig_sha256: SigSha256 = .none,
 
     pub fn any(self: *const Integrity) bool {
         return self.sig_unverified or self.bad_hdr_size or self.sig_overlap or
-            self.gfh_chain_mismatch or self.gfh_truncated;
+            self.gfh_chain_mismatch or self.gfh_truncated or
+            self.flash_type_mismatch or self.sig_sha256 == .mismatch;
     }
+};
+
+/// 容器级（设备头 / BRLYT）一致性检查，规则出自 U-Boot mtk_image.c 的
+/// verify 路径（verify_gen_header / put_brom_layout_header / put_hash）。
+pub const ContainerChecks = struct {
+    /// 设备头 version != 1 或 size != 0x200（官方期望）
+    boot_header_odd: bool = false,
+    /// BRLYT 不在期望偏移 0x200（官方按 boot.size 自描述定位）
+    brlyt_offset_moved: bool = false,
+    /// 没有任何槽位 type 命中官方媒体枚举 BrlytImgType
+    brlyt_no_media_type: bool = false,
+    /// header_size_2/total_size_2 副本与正本不一致（官方生成器令二者相等）
+    brlyt_copy_mismatch: bool = false,
+    /// BRLYT.header_size 处没有镜像起点（官方：首个 GFH 链在这里）
+    first_image_mismatch: bool = false,
 };
 
 pub const Image = struct {
@@ -94,7 +118,11 @@ pub const BootImage = struct {
     data: []const u8 = &.{},
     boot: fmt.BootHeader = .{},
     brlyt: fmt.BromLayout = .{},
+    /// BRLYT 实际所在偏移（官方按 boot.size 自描述定位，通常为 0x200）
+    brlyt_offset: u32 = 0,
     brlyt_region_count: u32 = 0,
+    /// BRLYT 媒体槽位推导出的 flash 编号（无槽位命中官方枚举时为 null）
+    media_flash: ?u8 = null,
 
     project: [64]u8 = @splat(0),
 
@@ -103,6 +131,7 @@ pub const BootImage = struct {
     /// BRLYT 槽位直接给出的镜像数量（扫描之前）
     brlyt_image_count: u32 = 0,
 
+    checks: ContainerChecks = .{},
     scan: ScanStats = .{},
     tail: TailInfo = .{},
 };
@@ -202,8 +231,30 @@ pub fn imageAdd(img: *BootImage, offset: u32) ?*Image {
     if (im.hdr_size > im.total_size) im.integrity.bad_hdr_size = true;
     if (im.hdr_size +| im.sig_size > im.total_size) im.integrity.sig_overlap = true;
 
+    // FILE_INFO.flash_type 与 BRLYT 媒体类型交叉核对（mtk_image.c verify_gfh）
+    if (img.media_flash) |media| {
+        if (im.flash_type != media) im.integrity.flash_type_mismatch = true;
+    }
+
     imageCollectGfh(img, im);
     im.payload_crc32 = crc32(payload(img, im));
+
+    // SHA256 尽力校验：U-Boot 生成器布局 = [镜像起点, 终点-32) 的摘要存末
+    // 32 字节（put_hash）；变体只覆盖载荷区。真机工具布局可能不同，不匹配
+    // 仅报告、不当硬错误。
+    if (im.sig_type == fmt.sig_type_sha256 and im.end >= im.offset + im.hdr_size + 32) {
+        const tail = img.data[im.end - 32 ..][0..32];
+        var digest: [32]u8 = undefined;
+        const Sha256 = std.crypto.hash.sha2.Sha256;
+        Sha256.hash(img.data[im.offset .. im.end - 32], &digest, .{});
+        if (!std.mem.eql(u8, &digest, tail)) {
+            Sha256.hash(img.data[im.offset + im.hdr_size .. im.end - 32], &digest, .{});
+        }
+        im.integrity.sig_sha256 = if (std.mem.eql(u8, &digest, tail))
+            SigSha256.ok
+        else
+            SigSha256.mismatch;
+    }
 
     // 保持按 offset 升序
     var i: usize = img.image_count - 1;

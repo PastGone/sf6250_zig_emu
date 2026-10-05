@@ -14,7 +14,8 @@ pub fn dump(img: *const image.BootImage) void {
     log.info(@src(), "  device header @0x000: name=\"{s}\" version={d} size=0x{x}", .{
         cstr(&img.boot.name), img.boot.version, img.boot.size,
     });
-    log.info(@src(), "  BRLYT @0x200: name=\"{s}\" version={d} header_size=0x{x} total_size=0x{x} ({d}/{d} regions used)", .{
+    log.info(@src(), "  BRLYT @0x{x}: name=\"{s}\" version={d} header_size=0x{x} total_size=0x{x} ({d}/{d} regions used)", .{
+        img.brlyt_offset,
         cstr(&img.brlyt.name),
         img.brlyt.version,
         img.brlyt.header_size,
@@ -22,6 +23,20 @@ pub fn dump(img: *const image.BootImage) void {
         img.brlyt_region_count,
         fmt.brlyt_max_regions,
     });
+    if (img.media_flash) |media|
+        log.info(@src(), "  boot media: {s} (flash={d})", .{ fmt.flashTypeName(media), media });
+
+    // 容器级一致性检查（规则出自 U-Boot mtk_image.c 的 verify 路径）
+    if (img.checks.boot_header_odd)
+        log.warn(@src(), "  ! 设备头 version/size 与官方期望不符（期望 version=1 size=0x200）", .{});
+    if (img.checks.brlyt_offset_moved)
+        log.warn(@src(), "  ! BRLYT 不在期望偏移 0x200，已按 boot.size 自描述定位", .{});
+    if (img.checks.brlyt_no_media_type)
+        log.warn(@src(), "  ! 没有任何 BRLYT 槽位 type 命中官方媒体枚举", .{});
+    if (img.checks.brlyt_copy_mismatch)
+        log.warn(@src(), "  ! BRLYT 副本不一致：header_size_2/total_size_2 != header_size/total_size（官方生成器约定，真机工具未遵循）", .{});
+    if (img.checks.first_image_mismatch)
+        log.warn(@src(), "  ! BRLYT.header_size=0x{x} 处没有镜像起点（官方：首个 GFH 链应在这里）", .{img.brlyt.header_size});
 
     if (img.project[0] != 0)
         log.info(@src(), "  project: \"{s}\"", .{cstr(&img.project)});
@@ -102,8 +117,13 @@ pub fn dump(img: *const image.BootImage) void {
         }
 
         if (im.integrity.any()) {
-            if (im.integrity.sig_unverified)
-                log.warn(@src(), "        ! sig_type={d} 但本工具未做任何签名/校验和验证", .{im.sig_type});
+            if (im.integrity.sig_unverified) {
+                switch (im.integrity.sig_sha256) {
+                    .none => log.warn(@src(), "        ! sig_type={d} 但未做签名校验", .{im.sig_type}),
+                    .ok => log.info(@src(), "        ✓ SHA256 签名校验通过（U-Boot 生成器布局）", .{}),
+                    .mismatch => log.warn(@src(), "        ! SHA256 校验不匹配：真机工具的签名布局与 U-Boot mkimage 不同（待研究）", .{}),
+                }
+            }
             if (im.integrity.bad_hdr_size)
                 log.warn(@src(), "        ! hdr_size(0x{x}) 与 total_size(0x{x}) 不自洽", .{ im.hdr_size, im.total_size });
             if (im.integrity.sig_overlap)
@@ -112,6 +132,8 @@ pub fn dump(img: *const image.BootImage) void {
                 log.warn(@src(), "        ! GFH 链终点 0x{x} != offset+hdr_size 0x{x}", .{ im.gfh_chain_end, im.offset + im.hdr_size });
             if (im.integrity.gfh_truncated)
                 log.warn(@src(), "        ! GFH 条目数超过上限 {d}，链可能不完整", .{image.gfh_max});
+            if (im.integrity.flash_type_mismatch)
+                log.warn(@src(), "        ! FILE_INFO.flash_type={d} 与 BRLYT 媒体类型 {d} 不符", .{ im.flash_type, img.media_flash.? });
         }
 
         for (im.gfh[0..im.gfh_count]) |e| {
