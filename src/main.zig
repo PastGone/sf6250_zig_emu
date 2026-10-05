@@ -2,6 +2,11 @@ const std = @import("std");
 
 const log = @import("log.zig");
 const mtk = @import("mtk_boot_image/mtk_boot_image.zig");
+const emu = @import("emu/emu.zig");
+
+/// LCD 尺寸：真机面板参数还没拿到，先按功能机常见的 240x320 开窗口。
+const lcd_width = 240;
+const lcd_height = 320;
 
 /// 待模拟的固件：原始字节 + 解析结果。
 /// `image` 不拥有数据，其 `data` 指向这里的 `data`（由调用方的 arena 持有）。
@@ -36,12 +41,60 @@ pub fn main(init: std.process.Init) !void {
     defer log.deinit();
 
     const args = try init.minimal.args.toSlice(arena);
-    const path = if (args.len > 1) args[1] else mtk.default_image;
+    // 第一个非 --xxx 的参数才是镜像路径，其余当开关处理
+    const path = firstPositional(args) orelse mtk.default_image;
 
     const fw = loadFirmware(io, arena, path) orelse return;
 
     log.info(@src(), "parsed \"{s}\"", .{path});
     mtk.dump(&fw.image);
 
-    // 下一步：用 fw.image 里的 load_addr / entry_point 把 BL 装进内存再开跑。
+    const lcd_only = hasArg(args, "--lcd");
+
+    // 1. CPU：把 BL 装进 SRAM 跑一段，看它先碰到哪些外设
+    var mach = try emu.Machine.init(arena);
+    defer mach.deinit();
+    mach.trace = hasArg(args, "--trace");
+    mach.lenient = hasArg(args, "--lenient");
+
+    mach.loadBootloader(&fw.image) catch |err| {
+        log.err(@src(), "failed to load bootloader (rc={s})", .{@errorName(err)});
+        return;
+    };
+    mach.mapFlashWindow(&fw.image) catch |err| {
+        log.err(@src(), "failed to map flash window (rc={s})", .{@errorName(err)});
+        return;
+    };
+    if (mach.lenient) {
+        mach.mapPeriphStubs() catch |err| {
+            log.err(@src(), "failed to map peripheral stubs (rc={s})", .{@errorName(err)});
+            return;
+        };
+    }
+    mach.run(20_000);
+
+    // 2. LCD：窗口 + 一帧占位画面；带 --lcd 时进入事件循环
+    var disp = try emu.Display.init("MT6250", lcd_width, lcd_height, 2);
+    defer disp.deinit();
+
+    @memset(disp.pixels, 0xff00_3000); // 占位：背光亮、无画面
+    disp.present();
+
+    while (lcd_only and disp.pump()) {
+        disp.delay(8);
+    }
+}
+
+fn hasArg(args: []const []const u8, flag: []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, flag)) return true;
+    }
+    return false;
+}
+
+fn firstPositional(args: []const []const u8) ?[]const u8 {
+    for (args[1..]) |a| {
+        if (!std.mem.startsWith(u8, a, "--")) return a;
+    }
+    return null;
 }
