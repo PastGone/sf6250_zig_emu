@@ -7,7 +7,7 @@ const std = @import("std");
 const log = @import("../log.zig");
 const mtk = @import("../mtk_boot_image/mtk_boot_image.zig");
 const uc = @import("unicorn.zig");
-const c = @import("c/unicorn.zig").c;
+const c = uc.c;
 
 /// MT6250 地址空间。除 SRAM 外基本都是*推测*，需要靠实测（固件访问地址）校正。
 pub const map = struct {

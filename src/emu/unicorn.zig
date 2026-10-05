@@ -5,7 +5,12 @@
 //! 其余保持 Unicorn 的原样语义。
 
 const std = @import("std");
-const c = @import("c/unicorn.zig").c;
+
+/// C API 原始绑定（@cImport 翻译）。封装层内部使用；需要绕过封装直接调
+/// C 时也可以从这里拿（例如 machine.zig 的 `uc.c.UC_ARM_REG_SP`）。
+pub const c = @cImport({
+    @cInclude("unicorn/unicorn.h");
+});
 
 pub const Error = error{
     NoMemory,
@@ -128,17 +133,17 @@ pub const Engine = struct {
     }
 
     pub fn hookCode(self: *const Engine, hh: *c.uc_hook, cb: c.uc_cb_hookcode_t, ctx: ?*anyopaque) Error!void {
-        try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_CODE, @constCast(@ptrCast(cb)), ctx, 1, 0));
+        try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_CODE, @ptrCast(@constCast(cb)), ctx, 1, 0));
     }
 
     /// 非法/未映射访问：返回 false 表示让 Unicorn 停下并报错
     pub fn hookMemInvalid(self: *const Engine, hh: *c.uc_hook, cb: c.uc_cb_eventmem_t, ctx: ?*anyopaque) Error!void {
-        try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_MEM_INVALID, @constCast(@ptrCast(cb)), ctx, 1, 0));
+        try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_MEM_INVALID, @ptrCast(@constCast(cb)), ctx, 1, 0));
     }
 
     /// 软件中断（SWI）：Nucleus/MAUI 的系统调用入口之一
     pub fn hookIntr(self: *const Engine, hh: *c.uc_hook, cb: c.uc_cb_hookintr_t, ctx: ?*anyopaque) Error!void {
-        try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_INTR, @constCast(@ptrCast(cb)), ctx, 1, 0));
+        try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_INTR, @ptrCast(@constCast(cb)), ctx, 1, 0));
     }
 
     pub fn hookDel(self: *const Engine, hh: c.uc_hook) Error!void {
