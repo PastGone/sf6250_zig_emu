@@ -2,3 +2,5 @@
 zig-pkg/
 zig-out/
 .zcode/
+docs/mt6250-sim-run761/
+ida/
