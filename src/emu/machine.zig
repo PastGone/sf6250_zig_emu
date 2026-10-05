@@ -93,6 +93,7 @@ pub const Machine = struct {
     svc_wr: u32 = 0,
     bp_logged: bool = false,
     bp_bss: bool = false,
+    bp_brlyt: bool = false,
     bss_calls: u32 = 0,
     bss_last_r0: u32 = 0,
     bss_last_r1: u32 = 0,
@@ -171,7 +172,7 @@ pub const Machine = struct {
     ///   - [ctx+0x00]    TLV 首记录：0x6b422101（TLV_SIZE_RECORD）+ 4，终止符 0x6820d104
     /// 服务表 +0x00/+0x08/+0x18/+0x34 → 四个服务，先实现为「返回 0」，
     /// 参数通过 onCode 的 svc 日志观察后逐步充实。
-    fn setupBootromContext(self: *Machine) !void {
+    fn setupBootromContext(self: *Machine, image: []const u8) !void {
         const ctx: u32 = bootrom_ctx_base;
         const svc: u32 = bootrom_svc_table;
         const svc_code: u32 = bootrom_svc_code;
@@ -206,6 +207,11 @@ pub const Machine = struct {
         // 服务函数体：movs r0,#0; bx lr（Thumb: 00 20 70 47）
         for (0..4) |i| {
             try self.eng.memWrite(svc_code + @as(u32, @intCast(i)) * 4, &.{ 0x00, 0x20, 0x70, 0x47 });
+        }
+        // BRLYT 表副本 @ctx+0x208：BL 校验 strcmp(r7,"BRLYT") 后按 20 字节槽
+        // 扫描 index==2 的 ExtBL 槽位并调用装载器（0x70008e78）
+        if (image.len >= 0x200 + 0x208) {
+            try self.eng.memWrite(ctx + 0x208, image[0x200..][0..0x208]);
         }
         log.info(@src(), "BootROM 上下文: ctx=0x{x:0>8} 服务表=0x{x:0>8} 服务代码=0x{x:0>8}", .{ ctx, svc, svc_code });
     }
@@ -264,7 +270,7 @@ pub const Machine = struct {
         try self.eng.regWrite(c.UC_ARM_REG_PC, &pc);
         // BootROM 交接：r10 = 共享数据区（BL 全程不赋值，只作为入参使用）。
         // 结构由 BootROM 预先备好，这里合成最小版本（见 setupBootromContext）。
-        try self.setupBootromContext();
+        try self.setupBootromContext(img.data);
         const ctx: u32 = bootrom_ctx_base;
         // 入口指令流（实测）：mrs/orr/msr 关中断 → mov r10, r4 → blx 初始化链。
         // BootROM 把共享数据指针放在 r4，BL 自己拷进 r10。
@@ -572,13 +578,15 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         });
         m.dumpExecHist();
     }
-    if (address == 0x7000_844a and !m.bp_logged) {
-        m.bp_logged = true;
+    if (address == 0x7000_844a and !m.bp_brlyt) {
+        m.bp_brlyt = true;
         var r7: u32 = 0;
+        var base: u32 = 0;
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_R7, &r7);
+        _ = c.uc_mem_read(engine, 0x7000_A0E4, &base, 4);
         var buf: [16]u8 = @splat(0);
         _ = c.uc_mem_read(engine, r7, &buf, buf.len);
-        log.info(@src(), "  [BRLYT校验] r7=0x{x:0>8} 内容={s} (strcmp 结果 r0)", .{ r7, buf });
+        log.info(@src(), "  [BRLYT校验] 全局[0x7000a0e4]=0x{x:0>8} r7=基址+0x208=0x{x:0>8} 内容={s}", .{ base, r7, buf });
     }
     if (address == 0x10008061) {
         log.info(@src(), "★ 阶段切换: 进入 BL2 (0x10008061)", .{});
