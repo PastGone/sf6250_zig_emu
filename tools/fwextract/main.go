@@ -132,7 +132,7 @@ func main() {
 
 	// 3. IDAPython 脚本：在已加载 flash 的 IDB 里补段 + 入口 + 地标
 	var py string
-	py += "import idaapi, ida_segment, ida_bytes, ida_funcs, idc, ida_name\n\n"
+	py += "import idaapi, ida_segment, ida_bytes, ida_funcs, ida_entry, idc, ida_name\n\n"
 	py += "# 前提：先把 flash_16m.bin 以 ARM Little-endian、基址 0x10000000 载入 IDB，再运行本脚本\n\n"
 	for _, s := range slices {
 		if s.name == "bl_sram" {
@@ -160,7 +160,7 @@ func main() {
 			name = fmt.Sprintf("entry_%x", e&^1)
 		}
 		py += fmt.Sprintf("ida_funcs.add_func(0x%08x)\n", e&^1)
-		py += fmt.Sprintf("idc.add_entry(0x%08x, %q, True)\n", e&^1, name)
+		py += fmt.Sprintf("idc.add_entry(ida_entry.get_entry_qty(), 0x%08x, %q, True)\n", e&^1, name)
 		py += fmt.Sprintf("idc.split_sreg_range(0x%08x, \"T\", %d, idc.SR_user)\n", e&^1, e&1)
 	}
 	py += "\n# 已知地标（命名 + 重复注释）\n"
