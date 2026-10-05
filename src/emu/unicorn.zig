@@ -94,6 +94,10 @@ pub const Engine = struct {
         try check(c.uc_mem_map_ptr(self.handle, address, size, perms, ptr));
     }
 
+    pub fn memUnmap(self: *const Engine, address: u64, size: u64) Error!void {
+        try check(c.uc_mem_unmap(self.handle, address, size));
+    }
+
     pub fn memWrite(self: *const Engine, address: u64, data: []const u8) Error!void {
         try check(c.uc_mem_write(self.handle, address, data.ptr, data.len));
     }

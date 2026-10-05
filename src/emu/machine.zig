@@ -13,10 +13,13 @@ const c = uc.c;
 pub const map = struct {
     /// boot 阶段的 flash 视图：BL 从这里读到自己的 GFH（实测 0x000008a8）
     pub const boot_view_base = 0x0000_0000;
+    pub const boot_view_size = 0x100_0000;
+    /// EMI 重映射后 0x0 变成的 RAM 大小（run761 地图：0x0 = 8MB 系统 RAM）
+    pub const boot_view_ram_size = 0x80_0000;
 
     /// 片内 SRAM：BL 的 load_addr 0x70008000 就落在这里（已由镜像确认）
     pub const sram_base = 0x7000_0000;
-    pub const sram_size = 0x0004_0000; // 256KB（推测）
+    pub const sram_size = 0x0010_0000; // 1MB（run761 地图；256KB 不够，pc 冲出边界）
 
     /// flash/EMI 窗口：MAUI 的 load_addr = 0x1000_0000 + 文件偏移，说明整片
     /// flash 被线性映射到这里，MAUI 直接在上面 XIP（已由镜像确认）
@@ -78,8 +81,12 @@ pub const Machine = struct {
     hook_mem: c.uc_hook = 0,
     hook_tblwr: c.uc_hook = 0,
     tbl_wr: u32 = 0,
+    hook_lowram: c.uc_hook = 0,
+    lowram_wr: u32 = 0,
     bp_logged: bool = false,
     bp_bss: bool = false,
+    remaped_low_ram: bool = false,
+    last_r10: u32 = 0,
 
     regions: [2]RegionCtx = undefined,
     /// UART1/2/3 的行缓冲（固件串口输出，按 \n / \r / 满行刷新）
@@ -111,6 +118,8 @@ pub const Machine = struct {
         try m.eng.hookMemInvalid(&m.hook_mem, onMemInvalid, m);
         // 监视 BL 回调表区的写入（诊断：谁注册了/没人注册）
         try m.eng.hookMem(&m.hook_tblwr, c.UC_HOOK_MEM_WRITE, 0x7000A100, 0x7000A1FF, onTblWrite, m);
+        // 监视低 RAM（0x0~0x10000）写入：内核 RAM 函数安装区
+        try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x0, 0xFFFF, onLowRamWrite, m);
         return m;
     }
 
@@ -126,6 +135,8 @@ pub const Machine = struct {
         }));
     }
 
+    /// EMI 重映射后 0x0 变成的 RAM 大小（run761 地图：0x0 = 8MB 系统 RAM）
+    pub const boot_view_ram_size = 0x80_0000;
     /// 外部 RAM（0x82000000 起 64MB）：BL 堆与共享数据区、MAUI 重定位目标
     /// （run761 实测 MAUI 在 0x84Exxxxx 执行）——见 docs/mt6250-wiring.md 内存图
     pub fn mapExternalRam(self: *Machine) !void {
@@ -133,6 +144,45 @@ pub const Machine = struct {
         const size = 0x400_0000;
         try self.eng.memMap(base, size, uc.Perm.combine(&.{ .read, .write, .exec }));
         log.info(@src(), "外部 RAM: 0x{x:0>8}..0x{x:0>8} ({d} MB, RWX)", .{ base, base + size, size >> 20 });
+    }
+
+    /// 合成 BootROM 共享数据区 + 服务表（模拟器扮演 BootROM 的部分）。
+    /// 布局依据 IDA 反编译：
+    ///   - [ctx+0x8A8]   bit1 → sub_70008266 的模式标志（v1 填 0 走默认路径）
+    ///   - [ctx+0x8DC]   服务表指针（init_dispatch 注册进 0x7000a114）
+    ///   - [ctx+0x28]    TLV 总大小（service_call_dispatch 的遍历上界）
+    ///   - [ctx+0x00]    TLV 首记录：0x6b422101（TLV_SIZE_RECORD）+ 4，终止符 0x6820d104
+    /// 服务表 +0x00/+0x08/+0x18/+0x34 → 四个服务，先实现为「返回 0」，
+    /// 参数通过 onCode 的 svc 日志观察后逐步充实。
+    fn setupBootromContext(self: *Machine) !void {
+        const ctx: u32 = 0x7000_D000;
+        const svc: u32 = 0x7000_E000;
+        const svc_code: u32 = 0x7000_E100;
+
+        // TLV：首记录 0x6b422101 + 长度 4，终止符 0x6820d104
+        try self.eng.memWrite(ctx, &.{ 0x01, 0x21, 0x42, 0x6b });
+        try self.eng.memWrite(ctx + 4, &.{ 4, 0, 0, 0 });
+        try self.eng.memWrite(ctx + 8, &.{ 0x04, 0xd1, 0x20, 0x68 });
+        // [ctx+0x28] = TLV 总大小
+        try self.eng.memWrite(ctx + 0x28, &.{ 0x0c, 0, 0, 0 });
+        // [ctx+0x8DC] = 服务表指针
+        try self.eng.memWrite(ctx + 0x8DC, &.{ 0x00, 0xe0, 0x00, 0x70 });
+        // 服务表：+0x00/+0x08/+0x18/+0x34 → 四个服务函数
+        const slots = [_]u32{ 0x00, 0x08, 0x18, 0x34 };
+        for (slots, 0..) |off, i| {
+            const a = svc + off;
+            try self.eng.memWrite(a, &.{
+                @truncate(svc_code + @as(u32, @intCast(i)) * 4),
+                @truncate((svc_code + @as(u32, @intCast(i)) * 4) >> 8),
+                @truncate((svc_code + @as(u32, @intCast(i)) * 4) >> 16),
+                0x70,
+            });
+        }
+        // 服务函数体：movs r0,#0; bx lr（Thumb: 00 20 70 47）
+        for (0..4) |i| {
+            try self.eng.memWrite(svc_code + @as(u32, @intCast(i)) * 4, &.{ 0x00, 0x20, 0x70, 0x47 });
+        }
+        log.info(@src(), "BootROM 上下文: ctx=0x{x:0>8} 服务表=0x{x:0>8} 服务代码=0x{x:0>8}", .{ ctx, svc, svc_code });
     }
 
     /// 外设窗口挂成 MMIO：已接线的寄存器按 docs/mt6250-wiring.md 给行为，
@@ -184,6 +234,13 @@ pub const Machine = struct {
 
         try self.eng.regWrite(c.UC_ARM_REG_SP, &sp);
         try self.eng.regWrite(c.UC_ARM_REG_PC, &pc);
+        // BootROM 交接：r10 = 共享数据区（BL 全程不赋值，只作为入参使用）。
+        // 结构由 BootROM 预先备好，这里合成最小版本（见 setupBootromContext）。
+        try self.setupBootromContext();
+        const ctx: u32 = 0x7000_D000;
+        // 入口指令流（实测）：mrs/orr/msr 关中断 → mov r10, r4 → blx 初始化链。
+        // BootROM 把共享数据指针放在 r4，BL 自己拷进 r10。
+        try self.eng.regWrite(c.UC_ARM_REG_R4, &ctx);
         // Supervisor 模式、IRQ/FIQ 关（Thumb 位由 UC_MODE_THUMB 设置）
         const cpsr: u32 = 0xd3;
         try self.eng.regWrite(c.UC_ARM_REG_CPSR, &cpsr);
@@ -328,6 +385,19 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         if (self.recordFault(addr, "emi-cmd")) {
             log.info(@src(), "  EMI 总线命令 write 0x{x}（busy 自清）", .{value});
         }
+        // 首次总线命令 = EMI 已配置完毕：0x0 的 NOR boot 视图重映射为 RAM
+        // （真机行为：GFH 早期从 NOR 视图读，之后 0x0 变成可写 RAM，
+        //  BL 在 0x0~0x8E0 现场构建共享数据表，见 wiring 文档卡点一节）
+        if (!self.remaped_low_ram) {
+            self.remaped_low_ram = true;
+            self.eng.memUnmap(map.boot_view_base, map.boot_view_size) catch {};
+            self.eng.memMap(map.boot_view_base, map.boot_view_ram_size, uc.Perm.combine(&.{
+                .read, .write, .exec,
+            })) catch {};
+            log.info(@src(), "  EMI 重映射: 0x{x:0>8} NOR 视图 → {d}MB 可写 RAM", .{
+                map.boot_view_base, map.boot_view_ram_size >> 20,
+            });
+        }
         return;
     }
 
@@ -366,6 +436,48 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_R2, &r2);
         _ = c.uc_reg_read(engine, c.UC_ARM_REG_R3, &r3);
         log.info(@src(), "  [断点] 0x70009b20 BSS清理: r0=0x{x:0>8} r1=0x{x:0>8} r2=0x{x:0>8} r3=0x{x:0>8}", .{ r0, r1, r2, r3 });
+    }
+    // 服务函数调用日志（BootROM 服务：0x7000e100 + i*4）
+    if (address >= 0x7000_E100 and address < 0x7000_E110) {
+        var a0: u32 = 0;
+        var a1r: u32 = 0;
+        var a2r: u32 = 0;
+        var a3r: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &a0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &a1r);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R2, &a2r);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R3, &a3r);
+        log.info(@src(), "  [BootROM服务] pc=0x{x:0>8} r0=0x{x:0>8} r1=0x{x:0>8} r2=0x{x:0>8} r3=0x{x:0>8}", .{ address, a0, a1r, a2r, a3r });
+        if (a0 >= 0x7000_0000 and a0 < 0x7004_0000) {
+            var buf: [32]u8 = undefined;
+            if (c.uc_mem_read(engine, a0, &buf, buf.len) == c.UC_ERR_OK) {
+                var hx: [3 * 32]u8 = undefined;
+                var n: usize = 0;
+                for (buf) |b| {
+                    const p = std.fmt.bufPrint(hx[n..], "{x:0>2} ", .{b}) catch break;
+                    n += p.len;
+                }
+                log.info(@src(), "  [BootROM服务] *r0 = {s}", .{hx[0..n]});
+            }
+        }
+    }
+    // r10(sl) 变化跟踪：定位它在哪里被清零/改写
+    {
+        var r10: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R10, &r10);
+        if (r10 != m.last_r10) {
+            if (m.instrs > 100000 or m.last_r10 != 0) {
+                log.info(@src(), "  [r10变化] pc=0x{x:0>8} sl: 0x{x:0>8} → 0x{x:0>8} (instrs={d})", .{ address, m.last_r10, r10, m.instrs });
+            }
+            m.last_r10 = r10;
+        }
+    }
+    if (m.instrs < 16) {
+        var code: [8]u8 = @splat(0);
+        _ = c.uc_mem_read(engine, address, &code, code.len);
+        log.info(@src(), "  [入口] #{d} pc=0x{x:0>8} bytes={x:0>2}{x:0>2} {x:0>2}{x:0>2}", .{
+            m.instrs, address, code[0], code[1], code[2], code[3],
+        });
     }
     if (address == 0x10008061) {
         log.info(@src(), "★ 阶段切换: 进入 BL2 (0x10008061)", .{});
@@ -417,6 +529,22 @@ fn onTblWrite(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: 
         });
     }
     m.tbl_wr += 1;
+    return true;
+}
+
+/// 低 RAM 写监视：EMI 重映射后谁在安装 RAM 函数（前 24 次）
+fn onLowRamWrite(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: c_int, value: i64, user: ?*anyopaque) callconv(.c) bool {
+    _ = typ;
+    _ = size;
+    const m: *Machine = @ptrCast(@alignCast(user));
+    if (m.lowram_wr < 24) {
+        var pc: u32 = 0;
+        _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_PC, &pc);
+        log.info(@src(), "  [低RAM写] pc=0x{x:0>8} -> [0x{x:0>8}] = 0x{x:0>8}", .{
+            pc, address, @as(u64, @bitCast(value)),
+        });
+    }
+    m.lowram_wr += 1;
     return true;
 }
 
