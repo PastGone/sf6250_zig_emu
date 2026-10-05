@@ -384,7 +384,7 @@ fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) cal
         log.info(@src(), "  [断点] 0x700082e0 入口: r0=0x{x:0>8} r1=0x{x:0>8} lr=0x{x:0>8}", .{ r0, r1, lr });
         m.dumpExecHist();
         // 导出运行时 SRAM hex，供离线反汇编（蹦床 + 传参处两段）
-        inline for (.{ 0x70009200, 0x70009300, 0x70009400, 0x70009500, 0x70009600, 0x70009700, 0x70009800, 0x70009900, 0x70009A00 }) |base| {
+        inline for (.{ 0x70008200, 0x70009200, 0x70009300, 0x70009400, 0x70009500, 0x70009600, 0x70009700, 0x70009800, 0x70009900, 0x70009A00 }) |base| {
             var mem: [0x100]u8 = undefined;
             if (c.uc_mem_read(engine, base, &mem, mem.len) == c.UC_ERR_OK) {
                 var hx: [3 * 0x100]u8 = undefined;
