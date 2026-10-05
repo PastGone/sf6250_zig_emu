@@ -1,6 +1,11 @@
 # machine.zig 拆分方案（纯重构，不改任何行为）
 
-现状：`src/emu/machine.zig` 731 行，混杂四种职责。本文是可直接执行的拆分说明。
+> **状态：已完成**（2026-10-06）。拆分在同一天的 BL2/MAUI 里程碑之后作为独立 commit
+> 落地，实测输出与拆分前逐行一致（见文末「验证结果」）。
+> 原文保留，作为拆分依据与操作记录的对照。
+
+现状（拆分前）：`src/emu/machine.zig` 731 行（后续涨到 948 行），混杂四种职责。
+本文是可直接执行的拆分说明。
 
 ## 现状结构（行号为拆分前 machine.zig 的实际行号）
 
@@ -66,11 +71,48 @@ machine.zig ↔ diag/periph/bootrom 互相 import 是**合法的**（Zig 惰性�
 
 ```sh
 zig build && zig build test
-./zig-out/bin/sf6250_zig_emu --lenient > /tmp/after.txt 2>&1
-diff <(拆分前同命令输出) /tmp/after.txt   # 逐字节一致才算通过
+./zig-out/bin/sf6250_zig_emu --lenient > after.txt 2>&1
+diff <(拆分前同命令输出) after.txt
 ```
 
-时间戳每次不同，diff 前先 `sed 's/^[0-9:]* //'` 去掉时间戳。
+时间戳每次不同，diff 前先去时间戳。
+
+**注意**：原方案写「去掉时间戳后逐字节一致」，实际上**做不到**——日志格式里带
+`file:line`（`%f:%l:`），拆文件后必然变。实际验证口径是「再去掉
+`LEVEL file:line:` 前缀后逐行一致」（`--budget` 用同一个值）：
+
+```sh
+norm() { sed 's/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9] //' \
+       | sed -E 's/^(INFO|WARN|ERROR|DEBUG) [^ ]+:[0-9]+: /\1: /'; }
+diff <(norm < before.txt) <(norm < after.txt) && echo IDENTICAL
+```
+
+顺带验证：日志正文（含 UART 输出、PC 轨迹、故障表、SF 直方图）完全没变，
+即拆分没有触碰任何 guest 可见行为。
+
+## 验证结果（2026-10-06 实测）
+
+```
+拆分前 machine.zig 948 行
+拆分后 machine.zig 357 / periph.zig 261 / diag.zig 286 / bootrom.zig 92
+zig build       通过
+zig build test  通过
+100M 条预算输出 归一化后逐行一致（1408 行）
+```
+
+拆分时顺手做掉的可选项：SF 服务区地址改成引用 `bootrom.svc_code`（值不变，
+消除硬编码）；`bp_*` 一次性标志表的改造**没做**（保持行为零风险）。
+
+## 拆分后的实际布局
+
+```
+src/emu/
+├── machine.zig   地址空间 + Machine 结构 + init/装载/run/故障表
+├── periph.zig    外设接线：known_regions/UART/CLK/EMI/LCM/GPIO/SF/RTC + MMIO 回调
+├── diag.zig      onCode（轨迹/阶段/断点/r10 跟踪）+ 三个写监视 + onMemInvalid
+├── bootrom.zig   ctx 常量 + setupBootromContext + onBusCommand（EMI 重映射）
+└── unicorn.zig / display.zig / emu.zig  不动
+```
 
 ## 拆分时顺手做（可选，同一 commit）
 
