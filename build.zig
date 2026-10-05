@@ -76,10 +76,16 @@ pub fn build(b: *std.Build) void {
 fn buildUnicorn(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
     const uc = b.path("vendor/unicorn");
     const m = exe.root_module;
+    const is_windows = target.result.os.tag == .windows;
 
     // include 目录 = CMakeLists.txt:98-106（CMAKE_BINARY_DIR 上的 config-host.h
-    // 换成预生成的 src/emu/uc_config/）。
-    m.addIncludePath(b.path("src/emu/uc_config"));
+    // 换成预生成的 src/emu/uc_config/，按目标 OS 选 host 侧那份）。
+    m.addIncludePath(b.path("src/emu/uc_config/common"));
+    const host_cfg: []const u8 = if (is_windows)
+        "src/emu/uc_config/windows"
+    else
+        "src/emu/uc_config/linux";
+    m.addIncludePath(b.path(host_cfg));
     m.addIncludePath(uc.path(b, "glib_compat"));
     m.addIncludePath(uc.path(b, "qemu"));
     m.addIncludePath(uc.path(b, "qemu/include"));
@@ -129,7 +135,8 @@ fn buildUnicorn(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.R
         .flags = global_flags,
     });
 
-    // 公共层（CMakeLists.txt:1177 UNICORN_COMMON_SRCS，非 MSVC 的 POSIX 分支）
+    // 公共层（CMakeLists.txt:1177 UNICORN_COMMON_SRCS；平台相关的
+    // oslib/qemu-thread 两个文件见下一个调用）
     m.addCSourceFiles(.{
         .root = uc,
         .files = &.{
@@ -158,10 +165,23 @@ fn buildUnicorn(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.R
             "qemu/util/qht.c",
             "qemu/util/pagesize.c",
             "qemu/util/cacheinfo.c",
-            "qemu/util/oslib-posix.c",
-            "qemu/util/qemu-thread-posix.c",
             "qemu/crypto/aes.c",
         },
+        .flags = global_flags,
+    });
+
+    // 平台层（CMakeLists.txt:1177-1236 的 MSVC/POSIX 两分支）。注意 qemu 的
+    // thread.h 在 __MINGW32__（含 zig 的 windows-gnu）下也走 POSIX/winpthreads，
+    // win32 文件是纯 MSVC 路径；MSVC 独有的 setjmp-wrapper-win32.asm 是 MASM，
+    // zig 路径用不到。
+    const use_win32_thread = target.result.abi == .msvc;
+    const platform_files: []const []const u8 = if (use_win32_thread)
+        &.{ "qemu/util/oslib-win32.c", "qemu/util/qemu-thread-win32.c" }
+    else
+        &.{ "qemu/util/oslib-posix.c", "qemu/util/qemu-thread-posix.c" };
+    m.addCSourceFiles(.{
+        .root = uc,
+        .files = platform_files,
         .flags = global_flags,
     });
 
@@ -209,9 +229,14 @@ fn buildUnicorn(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.R
         .flags = arm_flags,
     });
 
-    // CMakeLists 里 unicorn.pc 的 Libs.private：-lpthread -lm
-    m.linkSystemLibrary("pthread", .{});
-    m.linkSystemLibrary("m", .{});
+    // CMakeLists 里 unicorn.pc 的 Libs.private：-lpthread -lm。POSIX 平台层
+    // （含 windows-gnu 的 winpthreads）需要 pthread；libm 是 Linux 独有的拆分。
+    if (!use_win32_thread) {
+        m.linkSystemLibrary("pthread", .{});
+    }
+    if (!is_windows) {
+        m.linkSystemLibrary("m", .{});
+    }
 }
 
 const unicorn_global_flags = [_][]const u8{
