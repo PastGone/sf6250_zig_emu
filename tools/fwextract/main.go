@@ -137,19 +137,30 @@ func main() {
 	for _, s := range slices {
 		if s.name == "bl_sram" {
 			// BL 的 SRAM 视图内容与 flash 视图相同，直接补一段并填字节
-			py += fmt.Sprintf("seg = ida_segment.add_segm(0, 0x%08x, 0x%08x, %q, \"CODE\")\n",
+			py += fmt.Sprintf("if ida_segment.getseg(0x%08x) is None:\n", s.base)
+			py += fmt.Sprintf("    ida_segment.add_segm(0, 0x%08x, 0x%08x, %q, \"CODE\")\n",
 				s.base, s.base+uint32(len(s.data)), s.name)
 			py += fmt.Sprintf("ida_bytes.put_bytes(0x%08x, bytes.fromhex(%q))\n",
 				s.base, fmt.Sprintf("%x", s.data))
 		}
 	}
-	py += "\n# 入口与 Thumb 标志\n"
+	py += "\n# 入口与 Thumb 标志（IDA 9: add_entry(ea, name, makecode)）\n"
+	entryNames := map[string]string{
+		"bl_sram":   "bl_entry",
+		"extbl_xip": "extbl_entry",
+		"maui_xip":  "maui_entry",
+	}
 	for _, r := range regions {
 		if r.entry == 0 {
 			continue
 		}
 		e := r.entry
-		py += fmt.Sprintf("idc.add_entry(0x%08x)\n", e&^1)
+		name := entryNames[r.name]
+		if name == "" {
+			name = fmt.Sprintf("entry_%x", e&^1)
+		}
+		py += fmt.Sprintf("ida_funcs.add_func(0x%08x)\n", e&^1)
+		py += fmt.Sprintf("idc.add_entry(0x%08x, %q, True)\n", e&^1, name)
 		py += fmt.Sprintf("idc.split_sreg_range(0x%08x, \"T\", %d, idc.SR_user)\n", e&^1, e&1)
 	}
 	py += "\n# 已知地标（命名 + 重复注释）\n"
