@@ -140,6 +140,11 @@ pub const Engine = struct {
         try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_CODE, @ptrCast(@constCast(cb)), ctx, 1, 0));
     }
 
+    /// 带地址范围的代码钩子（只在范围内触发，比全局钩子省）
+    pub fn hookCodeRange(self: *const Engine, hh: *c.uc_hook, begin: u64, end: u64, cb: c.uc_cb_hookcode_t, ctx: ?*anyopaque) Error!void {
+        try check(c.uc_hook_add(self.handle, hh, c.UC_HOOK_CODE, @ptrCast(@constCast(cb)), ctx, begin, end));
+    }
+
     /// 带地址范围的内存访问钩子（UC_HOOK_MEM_WRITE/READ 等）
     pub fn hookMem(self: *const Engine, hh: *c.uc_hook, typ: c_int, begin: u64, end: u64, cb: c.uc_cb_eventmem_t, ctx: ?*anyopaque) Error!void {
         try check(c.uc_hook_add(self.handle, hh, typ, @ptrCast(@constCast(cb)), ctx, begin, end));

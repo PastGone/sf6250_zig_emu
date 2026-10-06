@@ -22,6 +22,7 @@ pub const known_regions = [_]struct { base: u32, name: []const u8 }{
     .{ .base = 0xA008_0000, .name = "UART3(LOG)" },
     .{ .base = 0xA014_0000, .name = "SF(串行flash)" },
     .{ .base = 0xA018_0000, .name = "EMI/总线命令" },
+    .{ .base = 0xA01F_0000, .name = "OSTD(OS timer)" },
     .{ .base = 0xA045_0000, .name = "LCM" },
     .{ .base = 0xA071_0000, .name = "RTC" },
     .{ .base = 0xA073_0000, .name = "ACFG GPIO" },

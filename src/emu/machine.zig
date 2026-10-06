@@ -70,7 +70,9 @@ pub const Machine = struct {
     hook_tblwr: c.uc_hook = 0,
     tbl_wr: u32 = 0,
     hook_lowram: c.uc_hook = 0,
+    hook_ramcode: c.uc_hook = 0,
     lowram_wr: u32 = 0,
+    rampatch_calls: u32 = 0,
     hook_svcwr: c.uc_hook = 0,
     svc_wr: u32 = 0,
     hook_ramf0wr: c.uc_hook = 0,
@@ -240,6 +242,8 @@ pub const Machine = struct {
         try m.eng.hookMem(&m.hook_tblwr, c.UC_HOOK_MEM_WRITE, 0x7000A100, 0x7000A1FF, diag.onTblWrite, m);
         // 监视低 RAM（0x0~0x10000）写入：内核 RAM 函数安装区
         try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x0, 0xFFFF, diag.onLowRamWrite, m);
+        // RAM 补丁区执行钩子：BootROM 服务的宿主侧实现（OS 启动 = 清 CPSR.I）
+        try m.eng.hookCodeRange(&m.hook_ramcode, map.ramf0_base, map.ramf0_base + map.ramf0_size - 1, diag.onRamPatchExec, m);
         // 监视服务表+服务代码写入：谁改写了我们登记的服务指针/代码
         try m.eng.hookMem(&m.hook_svcwr, c.UC_HOOK_MEM_WRITE, bootrom.svc_table, bootrom.svc_code + 0x20, diag.onSvcTableWrite, m);
         // 监视 RAMF0 写入：crt0 装载器把驱动/表段搬进来时，第一现场立刻可见
@@ -392,6 +396,8 @@ pub const Machine = struct {
             self.dumpMem(pc & ~@as(u32, 0xFF));
             // RAMF0 入口页：MAUI 拷进去执行的代码（静态镜像里也没有）
             if (self.ramf0_entry != 0) self.dumpMem(self.ramf0_entry & ~@as(u32, 0xFF));
+            // OSTD handler（LISR 11）：只在运行时存在（静态镜像乱码），tick 卡点就在这
+            self.dumpMem(0x7000_9500);
             // 低 RAM 0x0 起始页：ARM 异常向量表装在这里（0x18 = IRQ 入口）
             self.dumpMem(0x0000_0000);
             // BootROM/SRAM 蹦床区：MAUI crt0 会从 flash 拷一段到这里（含 IRQ 入口 0x700096B0）

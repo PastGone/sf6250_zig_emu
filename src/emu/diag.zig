@@ -374,6 +374,36 @@ fn enterIrq(m: *Machine, engine: ?*c.uc_engine, ret_addr: u32) void {
     }
 }
 
+/// RAM 补丁区（0xF0700000+）执行钩子 = BootROM 服务的宿主侧实现。
+/// veneer 表 101 个目标全部 bit0=1（Thumb），而 ARMv5TE 的 Thumb 没有
+/// MRS/MSR——固件侧无法开中断，所以「OS 启动」必须在模拟器侧完成：
+/// 清 CPSR.I + 返回 0，让 MAUI 的等待循环收到 tick 后继续走。
+pub fn onRamPatchExec(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) callconv(.c) void {
+    _ = size;
+    const m: *Machine = @ptrCast(@alignCast(user));
+    if (m.rampatch_calls < 8) {
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [BootROM补丁] pc=0x{x:0>8} r0=0x{x:0>8} r1=0x{x:0>8} lr=0x{x:0>8} → 清 I 位返回 0", .{
+            address, r0, r1, lr,
+        });
+    }
+    m.rampatch_calls += 1;
+    const zero: u32 = 0;
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_R0, &zero);
+    var cpsr: u32 = 0;
+    _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr);
+    cpsr &= ~@as(u32, 0x80); // 清 I 位：开 IRQ
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_CPSR, &cpsr);
+    var lr: u32 = 0;
+    _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_PC, &lr); // 返回调用者（lr 带 Thumb 位）
+}
+
 /// RAMF0 写监视：crt0 装载器把驱动/表段搬进 OS 数据区时抓第一现场（前 16 次）
 pub fn onRamF0Write(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: c_int, value: i64, user: ?*anyopaque) callconv(.c) bool {
     _ = typ;
