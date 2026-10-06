@@ -58,6 +58,9 @@ pub fn main(init: std.process.Init) !void {
     mach.lenient = hasArg(args, "--lenient");
     // 诊断：MAUI 的 RAM 补丁代码区（0xf07xxxxx）在本镜像里无人装载，见字段注释
     mach.ramf0_lr = hasArg(args, "--ramf0-lr");
+    // 周期 tick（每 N 条指令一次中断，0 = 关）：用来启动 OS 调度
+    mach.tick_interval = tickArg(args);
+    mach.tick_irq = @truncate(tickArg2(args, "--tick-irq=", 11));
 
     mach.loadBootloader(&fw.image) catch |err| {
         log.err(@src(), "failed to load bootloader (rc={s})", .{@errorName(err)});
@@ -107,6 +110,20 @@ fn firstPositional(args: []const []const u8) ?[]const u8 {
         if (!std.mem.startsWith(u8, a, "--")) return a;
     }
     return null;
+}
+
+/// `--tick=N`：每 N 条指令置一次中断（0 = 关，默认关）
+fn tickArg(args: []const []const u8) u64 {
+    return tickArg2(args, "--tick=", 0);
+}
+
+fn tickArg2(args: []const []const u8, prefix: []const u8, dflt: u64) u64 {
+    for (args) |a| {
+        if (std.mem.startsWith(u8, a, prefix)) {
+            return std.fmt.parseInt(u64, a[prefix.len..], 0) catch dflt;
+        }
+    }
+    return dflt;
 }
 
 /// `--budget=N`：指令预算（十进制或 0x 十六进制），默认 100M。

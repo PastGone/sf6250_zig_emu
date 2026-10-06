@@ -12,6 +12,15 @@ const machine = @import("machine.zig");
 const Machine = machine.Machine;
 const map = machine.map;
 
+/// 固件自己的 ARM 中断入口地址：MAUI 的异常向量表 IRQ 槽（XIP 0x10020318 →
+/// 运行时拷到低 RAM 0x18）指向这里。内容**不是**我们合成的：MAUI crt0 会把
+/// flash 0x872548 起 0x20A8 字节整段拷到 SRAM 0x70008000，其中 0x700096B0
+/// 是 ARM 中断入口（push {r1} / mrs r1,spsr / tst r1,#0x80 / subsne pc,lr,#4 …）。
+pub const irq_entry: u32 = 0x7000_96B0;
+/// IRQ 模式栈顶（RAMF0 上部；RAMF0 已按内存图映射）。固件自己也会用 SP_irq，
+/// 这里只是在交付中断时给一个安全的初值。
+pub const irq_stack_top: u32 = 0xF066_0000;
+
 // BootROM 交接上下文（模拟器扮演 BootROM 合成，见 docs/mt6250-wiring.md）
 // 地址选在 0x70041000+：BL 的 BSS 清理范围全部止于 0x70040000 以下
 pub const ctx_base: u32 = 0x7004_1000;

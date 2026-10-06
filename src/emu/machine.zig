@@ -137,6 +137,41 @@ pub const Machine = struct {
     /// 各命令字节的累计次数（run 结束打印，看 BL2 到底在干什么）
     sfc_op_counts: [256]u32 = @splat(0),
 
+    // ── 中断（IDA 反编译实证，详见 docs/mt6250-wiring.md）──────────────
+    // MAUI 的 ISR 分发器 sub_10021F50：读 0xA07601A0 拿中断号 → 查 LISR 表
+    // 0xF03D0310+12*irq → 调用 → 写 0xA07601A8 确认。
+    //   sub_100230A0: if (v & 0x100) return -1; else return v & 0xFF;
+    // 使能/屏蔽在 0xA0060040/44（置位）与 0x80/84（清位）（sub_10092F34/A4C）。
+    /// 0xA07601A0：bit8=无中断，低 8 位=当前中断号
+    irq_pending: i32 = -1,
+    /// 0xA07601A0 的原始寄存器值（回读保留位）
+    irq_status_raw: u32 = 0x100,
+    /// 0xA0060000 区的中断使能/清零寄存器（低 32 位源 + 高 32 位源）
+    intc_en_lo: u32 = 0,
+    intc_en_hi: u32 = 0,
+    /// 0xA0030000（16 位）：全局中断控制；MAUI 收尾 sub_10037A84(1) 置 0x2201
+    intc_ctrl: u16 = 0,
+    /// 0xA0030008（16 位）：MAUI 收尾写 0x1971
+    intc_ctrl8: u16 = 0,
+    /// 周期 tick：每 tick_interval 条指令置一次 pending（0 = 关闭）
+    tick_interval: u64 = 0,
+    next_tick: u64 = 0,
+    /// tick 用的中断号（11 = OSTD/OS timer，18 = GPT，见 LISR 注册处）
+    tick_irq: u8 = 11,
+    /// 是否已交付过中断（诊断计数）
+    irq_count: u32 = 0,
+    /// 是否已打印过首次中断确认
+    irq_logged: bool = false,
+    /// CPSR.I 采样跟踪（诊断：固件到底有没有开 CPU 中断）
+    i_bit_last: bool = true,
+    /// 采样上限（避免刷屏）
+    i_bit_samples: u32 = 0,
+    /// IRQ 现场：进入中断时保存，异常返回后恢复
+    irq_active: bool = false,
+    irq_ret: u32 = 0,
+    irq_saved_regs: [16]u32 = @splat(0),
+    irq_saved_cpsr: u32 = 0,
+
     // ── RTC（0xA0710000）────────────────────────────────────────────────
     // 依据：《MT6250 数据手册》RTC 章 + BL 0x70008f00 的初始化序列。
     // 寄存器文件语义 = 写入值读回（固件每写一个值就轮询读回比对）。
@@ -349,6 +384,10 @@ pub const Machine = struct {
             self.dumpMem(pc & ~@as(u32, 0xFF));
             // RAMF0 入口页：MAUI 拷进去执行的代码（静态镜像里也没有）
             if (self.ramf0_entry != 0) self.dumpMem(self.ramf0_entry & ~@as(u32, 0xFF));
+            // 低 RAM 0x0 起始页：ARM 异常向量表装在这里（0x18 = IRQ 入口）
+            self.dumpMem(0x0000_0000);
+            // BootROM/SRAM 蹦床区：MAUI crt0 会从 flash 拷一段到这里（含 IRQ 入口 0x700096B0）
+            self.dumpMem(0x7000_9600);
         }
         self.dumpExecHist();
         self.reportFaults();

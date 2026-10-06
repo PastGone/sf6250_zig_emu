@@ -14,6 +14,7 @@ const bootrom = @import("bootrom.zig");
 /// 已接线的寄存器区块（地址→名字）。行为依据见 docs/mt6250-wiring.md。
 pub const known_regions = [_]struct { base: u32, name: []const u8 }{
     .{ .base = 0xA000_0000, .name = "CHIP-ID/启动模式" },
+    .{ .base = 0xA006_0000, .name = "UART1/中断使能" },
     .{ .base = 0xA052_0000, .name = "传输/DMA引擎" },
     .{ .base = 0xA005_0000, .name = "CLK/PLL" },
     .{ .base = 0xA006_0000, .name = "UART1(AT)" },
@@ -85,6 +86,9 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     if (addr == 0xA005_0318) return 0x2;
     // EMI/总线命令状态：bit0=0（命令已完成，BL 0x70008FA8 轮询的位）
     if (addr == 0xA018_00A0) return 0x00;
+    // 中断全局控制（0xA0030000/08）：回读保留（MAUI sub_10037A84 读改写）
+    if (addr == 0xA003_0000) return self.intc_ctrl;
+    if (addr == 0xA003_0008) return self.intc_ctrl8;
     // 串行 flash 控制器（SF，0xA0140000）：控制/状态 + 数据窗口两个区段
     if ((addr >= 0xA014_0000 and addr < 0xA014_0100) or (addr >= 0xA014_0800 and addr < 0xA014_0810)) {
         return sfcRead(self, addr - 0xA014_0000, size);
@@ -92,6 +96,15 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     // RTC（0xA0710000）：寄存器文件，写入值读回（数据手册 RTC 章）
     if (addr >= 0xA071_0000 and addr < 0xA071_0100) {
         return leRead(self.rtc_regs[0..], addr - 0xA071_0000, size);
+    }
+    // 中断控制器（0xA0760000）：+0x1A0 读 = bit8 无中断 / 低 8 位中断号
+    // （MAUI sub_100230A0 的读法）；+0x1A0 的其它位回读保留
+    if (addr >= 0xA076_0000 and addr < 0xA076_0100) {
+        if (addr - 0xA076_0000 == 0x1A0) {
+            if (self.irq_pending < 0) return (@as(u32, self.irq_status_raw) | 0x100);
+            return @as(u32, @intCast(self.irq_pending)) & 0xFF;
+        }
+        return 0;
     }
     // 芯片标识/启动模式寄存器（0xA0000000）：见 chip_regs 字段注释
     if (addr >= 0xA000_0000 and addr < 0xA000_0010) {
@@ -263,8 +276,24 @@ fn sfcExec(self: *Machine) void {
 /// 已接线寄存器的写行为；其余记录后丢弃
 fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
     if (uartIndex(addr)) |i| {
-        if (addr & 0xFFFF == 0x0000) { // THR：固件串口发送
+        const off = addr & 0xFFFF;
+        if (off == 0x0000) { // THR：固件串口发送
             uartPutc(self, i, @truncate(value));
+            return;
+        }
+        // 0xA0060000 区 +0x40..+0xA4 是中断使能/清位寄存器（IDA 反编译
+        // sub_10092F34「使能 IRQ n」/ sub_10092A4C「清」的写点，值为 1<<n 掩码）
+        if (i == 0 and ((off >= 0x40 and off <= 0x47) or (off >= 0x80 and off <= 0x87) or
+            (off >= 0xA0 and off <= 0xA7)))
+        {
+            const mask: u32 = @truncate(value);
+            switch (off) {
+                0x40, 0xA0 => self.intc_en_lo |= mask,
+                0x44, 0xA4 => self.intc_en_hi |= mask,
+                0x80 => self.intc_en_lo &= ~mask,
+                0x84 => self.intc_en_hi &= ~mask,
+                else => {},
+            }
             return;
         }
     }
@@ -290,6 +319,30 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
     }
     if (addr >= 0xA071_0000 and addr < 0xA071_0100) {
         leWrite(self.rtc_regs[0..], addr - 0xA071_0000, size, value);
+        return;
+    }
+    if (addr == 0xA003_0000) {
+        self.intc_ctrl = @truncate(value);
+        if (!self.irq_logged) {
+            self.irq_logged = true;
+            const site = accessSite(self);
+            log.info(@src(), "  [INTC] 全局使能 0xA0030000 = 0x{x} pc=0x{x:0>8}（中断已开）", .{ value, site.pc });
+        }
+        return;
+    }
+    if (addr == 0xA003_0008) {
+        self.intc_ctrl8 = @truncate(value);
+        return;
+    }
+    // 中断控制器：写 +0x1A8 = 确认（清 pending）；0xA0060040/44/80/84 = 使能置位/清位
+    if (addr >= 0xA076_0000 and addr < 0xA076_0100) {
+        if (addr - 0xA076_0000 == 0x1A8) {
+            if (self.irq_pending >= 0 and !self.irq_logged) {
+                self.irq_logged = true;
+                log.info(@src(), "  [INTC] 中断 {d} 已确认（ack）", .{self.irq_pending});
+            }
+            self.irq_pending = -1;
+        }
         return;
     }
     // 芯片标识寄存器组：也接受写入（真机是只读 eFuse，固件不会写；留着便于调试）

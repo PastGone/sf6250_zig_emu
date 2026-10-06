@@ -241,8 +241,113 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
             }
         }
     }
+    // CPSR.I 变化采样（每 4096 条一次）：确认固件有没有开 CPU 中断（诊断用）
+    if (m.tick_interval != 0 and (m.instrs & 0xFFF) == 0) {
+        var cpsr_i: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr_i);
+        const i_now = (cpsr_i & 0x80) != 0;
+        if (i_now != m.i_bit_last) {
+            m.i_bit_last = i_now;
+            if (m.i_bit_samples < 32) {
+                m.i_bit_samples += 1;
+                log.info(@src(), "  [CPSR.I] → {s} pc=0x{x:0>8} (instrs={d})", .{
+                    if (i_now) "关中断" else "开中断",
+                    address,
+                    m.instrs,
+                });
+            }
+        }
+    }
+
+    // ── 周期 tick 与中断交付（Unicorn 没有注入中断的 API，这里手工模拟
+    //    ARM 的 IRQ 异常入口/返回；见 docs/mt6250-wiring.md「中断」一节）──
+    if (m.irq_active) {
+        // IRQ 桩用 `subs pc,lr,#4` 返回：PC 回到中断点即视为异常返回。
+        // CPSR 已由 CPU 从 SPSR_irq 恢复，这里按「中断不破坏 r0-r12/lr」的
+        // 约定把现场写回，保证与真机一致（也兼容 Unicorn 的 bank 行为差异）。
+        if (address == m.irq_ret) {
+            var i: usize = 0;
+            while (i < 13) : (i += 1) {
+                _ = c.uc_reg_write(engine, c.UC_ARM_REG_R0 + @as(c_int, @intCast(i)), &m.irq_saved_regs[i]);
+            }
+            _ = c.uc_reg_write(engine, c.UC_ARM_REG_SP, &m.irq_saved_regs[13]);
+            _ = c.uc_reg_write(engine, c.UC_ARM_REG_LR, &m.irq_saved_regs[14]);
+            m.irq_active = false;
+        }
+    } else {
+        if (m.tick_interval != 0 and m.instrs >= m.next_tick) {
+            m.next_tick = m.instrs + m.tick_interval;
+            // 只按 OS 是否使能过来决定：0xA0030000 bit0（全局，sub_10037A84 置位）
+            // 或 0xA0060040/44 的源使能位（sub_10092F34 置位）
+            if ((m.intc_ctrl & 1) != 0 or m.intc_en_lo != 0 or m.intc_en_hi != 0) {
+                m.irq_pending = m.tick_irq;
+            }
+        }
+        if (m.irq_pending >= 0) {
+            // 真机语义：CPSR.I=1 时 IRQ 被屏蔽（悬起但不动），只有 I=0 才交付。
+            // 不检查会踩到「中断入口按 SPSR.I 早退 → pending 不清 → 中断风暴」。
+            var cur: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cur);
+            if ((cur & 0x80) == 0) {
+                enterIrq(m, engine, @truncate(address));
+                return;
+            }
+        }
+    }
     if (m.trace) {
         log.debug(@src(), "pc=0x{x:0>8} size={d}", .{ address, size });
+    }
+}
+
+/// 手工模拟 ARM 的 IRQ 异常入口：保存现场 → 切 IRQ 模式/换栈 → PC = BootROM IRQ 桩。
+/// 返回地址按 ARM 约定放 LR_irq = 中断点 + 4（桩用 `subs pc,lr,#4` 返回）。
+fn enterIrq(m: *Machine, engine: ?*c.uc_engine, ret_addr: u32) void {
+    var i: usize = 0;
+    while (i < 13) : (i += 1) {
+        var v: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0 + @as(c_int, @intCast(i)), &v);
+        m.irq_saved_regs[i] = v;
+    }
+    _ = c.uc_reg_read(engine, c.UC_ARM_REG_SP, &m.irq_saved_regs[13]);
+    _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &m.irq_saved_regs[14]);
+    m.irq_saved_regs[15] = ret_addr;
+    _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &m.irq_saved_cpsr);
+
+    // 不用合成桩：MAUI 的 crt0 已把 flash 0x872548（0x20A8 字节）整段拷到
+    // SRAM 0x70008000，其中 0x700096B0 就是**固件自己的 ARM 中断入口**
+    // （push {r1} / mrs r1,spsr / tst r1,#0x80 / pop {r1} / subsne pc,lr,#4 …）。
+    // 之前用合成桩盖掉它是错的（会执行到 0x1008E090 处非法指令）。
+    m.irq_ret = ret_addr;
+    m.irq_active = true;
+    m.irq_count += 1;
+
+    // IRQ 模式、ARM 态、I 置位（F 保持）；SPSR_irq = 旧 CPSR
+    var cpsr: u32 = (m.irq_saved_cpsr & ~@as(u32, 0x3F)) | 0x12 | 0x80;
+    cpsr &= ~@as(u32, 0x20);
+    // 先切模式再写 SPSR：UC_ARM_REG_SPSR 写的是**当前模式**的 SPSR，
+    // 顺序反了就会写到 SPSR_svc，异常返回时恢复出错误的 CPSR（实测踩过）
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_CPSR, &cpsr);
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_SPSR, &m.irq_saved_cpsr);
+    if (m.irq_count == 1) {
+        var cpsr_rb: u32 = 0;
+        var spsr_rb: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr_rb);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_SPSR, &spsr_rb);
+        log.info(@src(), "  [IRQ 诊断] 写入后回读 cpsr=0x{x:0>8} spsr=0x{x:0>8}（期望 spsr=0x{x:0>8}）", .{
+            cpsr_rb, spsr_rb, m.irq_saved_cpsr,
+        });
+    }
+    var sp: u32 = bootrom.irq_stack_top;
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_SP, &sp);
+    var lr: u32 = ret_addr +% 4;
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_LR, &lr);
+    var pc: u32 = bootrom.irq_entry;
+    _ = c.uc_reg_write(engine, c.UC_ARM_REG_PC, &pc);
+
+    if (m.irq_count <= 8 or m.irq_count % 256 == 0) {
+        log.info(@src(), "  [IRQ #{d}] 中断 {d} 交付: 中断点 pc=0x{x:0>8} → 桩 0x{x:0>8} (instrs={d})", .{
+            m.irq_count, m.irq_pending, ret_addr, bootrom.irq_entry, m.instrs,
+        });
     }
 }
 
