@@ -58,6 +58,9 @@ pub fn main(init: std.process.Init) !void {
     mach.lenient = hasArg(args, "--lenient");
     // 诊断：MAUI 的 RAM 补丁代码区（0xf07xxxxx）在本镜像里无人装载，见字段注释
     mach.ramf0_lr = hasArg(args, "--ramf0-lr");
+    // 诊断：flash 窗口也映射为可写（判断 XIP 地址到底会不会被 DMA/固件写）
+    mach.flash_rw = hasArg(args, "--flash-rw");
+    mach.cake_patch = hasArg(args, "--cake-patch");
     // 周期 tick（每 N 条指令一次中断，0 = 关）：用来启动 OS 调度
     mach.tick_interval = tickArg(args);
     mach.tick_irq = @truncate(tickArg2(args, "--tick-irq=", 11));

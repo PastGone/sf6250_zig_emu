@@ -284,6 +284,217 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
 
     // ── 周期 tick 与中断交付（Unicorn 没有注入中断的 API，这里手工模拟
     //    ARM 的 IRQ 异常入口/返回；见 docs/mt6250-wiring.md「中断」一节）──
+    // 传输引擎操作函数（0x10032670 起，r4 = 寄存器基址）：确认基址到底是多少
+    if (address == 0x1003_2670 or address == 0x1003_26ec) {
+        var r4: u32 = 0;
+        var r5: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R4, &r4);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R5, &r5);
+        log.info(@src(), "  [DMA基址] pc=0x{x:0>8}: r4=0x{x:0>8} r5=0x{x:0>8}", .{ address, r4, r5 });
+    }
+    // DMA 结果校验（0x10032712 `ldr r0,[r0]` / 0x10032714 `cmp r0,r1`）：
+    // 固件在传输引擎跑完后读回目标内存比对期望值——我们的 DMA 是「假完成」，
+    // 不搬数据，所以这里必然不等 → assert → 关机。抓出双方值确认。
+    if (address == 0x1003_2712) {
+        var r0: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        log.info(@src(), "  [DMA校验] 目标地址 = 0x{x:0>8}", .{r0});
+    }
+    if (address == 0x1003_2714) {
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        log.info(@src(), "  [DMA校验] 实际=0x{x:0>8} 期望=0x{x:0>8} → {s}", .{
+            r0, r1, if (r0 == r1) "通过" else "失败→assert",
+        });
+    }
+    // assert 失败入口（0x1007bd0e）：0x100324b8 的 ALICE_1 校验逐字节检查，
+    // 任一字节不匹配就 `bl` 到这里。抓 lr = 具体哪个检查失败。
+    if (address == 0x1007_bd0e) {
+        var lr: u32 = 0;
+        var r4: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R4, &r4);
+        var b: [8]u8 = @splat(0);
+        const ok = c.uc_mem_read(engine, r4, &b, 8) == c.UC_ERR_OK;
+        log.info(@src(), "  [ASSERT失败] lr=0x{x:0>8} r4=0x{x:0>8} 内容={s}", .{
+            lr, r4, if (ok) b[0..8] else "??",
+        });
+        m.dumpExecHistTail(24);
+    }
+    // 异常上报入口（0x1002E100(r0, r1) → bl 0x100324b8 → assert 打印 → 关机）。
+    // 抓调用者 = 触发这次 fatal error 的地方。
+    if (address == 0x1002_e100) {
+        var lr: u32 = 0;
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        log.info(@src(), "  [异常上报] 0x1002e100: lr=0x{x:0>8} r0=0x{x:0>8} r1={d} (instrs={d})", .{
+            lr, r0, r1, m.instrs,
+        });
+        m.dumpExecHistTail(64);
+    }
+    // Assert 打印点（0x1008b7a8 = `bl 0x10092b0c` 打 "[%d] Assert fail: Caller
+    // Address: 0x%x Line: %d - %s ..."）。可变参数在栈上，抓出来就能知道断言
+    // 发生在哪个调用者、第几行。
+    if (address == 0x1008_b7a8) {
+        var sp: u32 = 0;
+        var regs: [4]u32 = @splat(0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_SP, &sp);
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0 + @as(c_int, @intCast(i)), &regs[i]);
+        }
+        var stack: [8]u32 = @splat(0);
+        _ = c.uc_mem_read(engine, sp, &stack, 32);
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [ASSERT] r0=0x{x:0>8} r1=0x{x:0>8} r2=0x{x:0>8} r3=0x{x:0>8} lr=0x{x:0>8}", .{
+            regs[0], regs[1], regs[2], regs[3], lr,
+        });
+        log.info(@src(), "  [ASSERT] sp=0x{x:0>8} 栈: {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}", .{
+            sp, stack[0], stack[1], stack[2], stack[3], stack[4], stack[5],
+        });
+    }
+    // 固件日志：0x10092b0c(r0, r1=字符串) 是 MAUI 的打印/追加入口。把它打的
+    // 字符串 dump 出来——异常路径会在这里说出失败原因（实测 0x1003092e 的
+    // 关机块就是「打两行日志 → 关机」）。
+    if (address == 0x1009_2b0c and m.fw_log_n < 200) {
+        m.fw_log_n += 1;
+        var r1: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        var sbuf: [160]u8 = @splat(0);
+        if (c.uc_mem_read(engine, r1, &sbuf, sbuf.len) == c.UC_ERR_OK) {
+            var n: usize = 0;
+            while (n < sbuf.len and sbuf[n] != 0) : (n += 1) {}
+            var pc: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_PC, &pc);
+            var lr: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+            log.info(@src(), "  [固件日志] lr=0x{x:0>8}: {s}", .{ lr, sbuf[0..n] });
+        }
+    }
+    // magic 写入点（0x10021c76 调 sub_10092E04，返回 ==1 才写 magic）
+    if (address == 0x1002_1c7a) {
+        var r0: u32 = 0;
+        var v: u16 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        if (c.uc_mem_read(engine, 0xF03D_004E, &v, 2) != c.UC_ERR_OK) v = 0xffff;
+        log.info(@src(), "  [启动模式] sub_10092E04 返回 r0={d}, *(u16*)0xF03D004E={d} → {s} (instrs={d})", .{
+            r0, v, if (r0 == 1) "会写 magic" else "不写 magic→后续关机", m.instrs,
+        });
+    }
+    // 关机决策比较点（0x100308cc = `cmp r0,r1`，下一条 bne → 关机路径）：
+    // 打印 *(0xF03CFE24) 的实际值与期望值
+    if (address == 0x1003_08cc) {
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        log.info(@src(), "  [关机检查] *(0xF03CFE24)=0x{x:0>8} 期望=0x{x:0>8} → {s} (instrs={d})", .{
+            r0, r1, if (r0 == r1) "通过" else "失败→关机", m.instrs,
+        });
+    }
+    // 关机错误处理块入口（0x1003092e：打印两行日志 → bl 0x1002e358 关机）。
+    // 它是被分支跳入的（正常路径 0x1003092c 是 `b .` 自旋），这里抓跳转来源。
+    if (address == 0x1003_092e) {
+        var lr: u32 = 0;
+        var r0: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        log.info(@src(), "  [关机错误处理] 0x1003092e: lr=0x{x:0>8} r0=0x{x:0>8} (instrs={d})", .{
+            lr, r0, m.instrs,
+        });
+        m.dumpExecHistTail(512);
+    }
+    // 关机函数（0x1002e358 起，收尾是 0x1002e37e 写 0xA0030008=0x1971）：
+    // 抓 lr = 谁调用了这个关机函数
+    if (address == 0x1002_e358) {
+        var lr: u32 = 0;
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        log.info(@src(), "  [关机函数] 0x1002e358: lr=0x{x:0>8} r0=0x{x:0>8} r1=0x{x:0>8} (instrs={d})", .{
+            lr, r0, r1, m.instrs,
+        });
+        m.dumpExecHistTail(24);
+    }
+    // 关机路径入口（0x1002e360）：抓 lr = 谁调用了这个关机函数
+    if (address == 0x1002_e360) {
+        var lr: u32 = 0;
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        log.info(@src(), "  [关机入口] 0x1002e360: lr=0x{x:0>8} r0=0x{x:0>8} r1=0x{x:0>8} (instrs={d})", .{
+            lr, r0, r1, m.instrs,
+        });
+        m.dumpExecHistTail(24);
+    }
+    if (m.irq_active and m.irq_trace_n < m.irq_trace.len) {
+        m.irq_trace[m.irq_trace_n] = @truncate(address);
+        m.irq_trace_n += 1;
+    }
+    // ── Nucleus 中断上下文诊断 ────────────────────────────────────────────
+    // 实测 CPU 到达关机自旋时停在 IRQ 模式（cpsr mode=0x12），说明异常返回
+    // 没把模式切回去。两个待验证点：
+    //  (a) 0x70009e18 = TCT_Interrupt_Context_Save 的入口判定：读 *0xF0423174
+    //      （中断嵌套计数），<=0 就跳过「切 SVC 模式 + 保存任务上下文」
+    //  (b) 0x70009f54 = `ldm sp,{...,pc}^` 异常返回：Unicorn 是否真从 SPSR
+    //      恢复了 CPSR（ARM 的 ^ 语义，Unicorn 2.1.4 实现可能不完整）
+    if (address == 0x7000_9e18 or address == 0x7000_9f34 or address == 0x7000_9f4c) {
+        var cpsr: u32 = 0;
+        var cnt: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr);
+        if (c.uc_mem_read(engine, 0xF042_3174, &cnt, 4) != c.UC_ERR_OK) cnt = 0xdead_beef;
+        log.info(@src(), "  [IRQctx] pc=0x{x:0>8} cpsr=0x{x:0>8} (mode=0x{x}) *0xF0423174={d} (instrs={d})", .{
+            address, cpsr, cpsr & 0x1F, cnt, m.instrs,
+        });
+    }
+    if (address == 0x7000_9f54) {
+        var cpsr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr);
+        log.info(@src(), "  [IRQret] ldm^ 前 cpsr=0x{x:0>8} (mode=0x{x})", .{ cpsr, cpsr & 0x1F });
+        m.irq_ret_probe = true;
+    } else if (m.irq_ret_probe) {
+        m.irq_ret_probe = false;
+        var cpsr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr);
+        log.info(@src(), "  [IRQret] ldm^ 后 pc=0x{x:0>8} cpsr=0x{x:0>8} (mode=0x{x})", .{
+            address, cpsr, cpsr & 0x1F,
+        });
+    }
+    // MAUI 关机序列入口（0x1002e37e = 写 0xA0030008=0x1971 前）：
+    // 抓 lr 与参数，回溯是谁决定关机。
+    // 注意：必须放在 irq_active 判断**之前**——实测 CPU 到达这里时仍停在
+    // IRQ 模式（cpsr mode=0x12），若放在 else 分支里这个断点永远不触发。
+    if (address == 0x1002_e37e or address == 0x1002_e38a) {
+        if (!m.shutdown_bp) {
+            m.shutdown_bp = true;
+            var lr: u32 = 0;
+            var r0: u32 = 0;
+            var cpsr: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr);
+            log.info(@src(), "  [关机] pc=0x{x:0>8}: r0=0x{x:0>8} lr=0x{x:0>8} cpsr=0x{x:0>8} (mode=0x{x}, I={d}) (instrs={d})", .{
+                address, r0, lr, cpsr, cpsr & 0x1F, (cpsr >> 7) & 1, m.instrs,
+            });
+            m.dumpExecHistTail(48);
+            m.dumpIrqTrace();
+        }
+        // 已确认进入关机自旋，直接停机，省掉剩余预算
+        if (address == 0x1002_e38a) {
+            _ = c.uc_emu_stop(engine);
+            return;
+        }
+    }
     if (m.irq_active) {
         // IRQ 桩用 `subs pc,lr,#4` 返回：PC 回到中断点即视为异常返回。
         // CPSR 已由 CPU 从 SPSR_irq 恢复，这里按「中断不破坏 r0-r12/lr」的
@@ -296,16 +507,18 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
             _ = c.uc_reg_write(engine, c.UC_ARM_REG_SP, &m.irq_saved_regs[13]);
             _ = c.uc_reg_write(engine, c.UC_ARM_REG_LR, &m.irq_saved_regs[14]);
             m.irq_active = false;
+        } else {
+            // RTOS（Nucleus）会在中断里做上下文切换：异常返回后不一定回到中断
+            // 点，而是切到另一个任务栈继续跑。所以「回到 irq_ret」不是可靠的
+            // 返回判据——实测这里永远不成立，导致 irq_active 卡死、tick 只交付
+            // 一次（后续 OS 调度起不来 → MAUI 走关机路径）。可靠判据是 CPU 模式：
+            // 离开 IRQ 模式（0x12）即视为这次中断处理结束。
+            var mode: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &mode);
+            if ((mode & 0x1F) != 0x12) m.irq_active = false;
         }
-    } else {
-        // MAUI 关机自旋（0x1002e38a）：首次到达时 dump 轨迹，回溯关机决策
-        if (address == 0x1002_e38a and !m.shutdown_bp) {
-            m.shutdown_bp = true;
-            var lr: u32 = 0;
-            _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
-            log.info(@src(), "  [关机] 到达 0x1002e38a 自旋, lr=0x{x:0>8} (instrs={d})", .{ lr, m.instrs });
-            m.dumpExecHist();
-        }
+    }
+    if (!m.irq_active) {
         if (m.tick_interval != 0 and m.instrs >= m.next_tick) {
             m.next_tick = m.instrs + m.tick_interval;
             // 只按 OS 是否使能过来决定：0xA0030000 bit0（全局，sub_10037A84 置位）
@@ -317,9 +530,10 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
         if (m.irq_pending >= 0) {
             // 真机语义：CPSR.I=1 时 IRQ 被屏蔽（悬起但不动），只有 I=0 才交付。
             // 不检查会踩到「中断入口按 SPSR.I 早退 → pending 不清 → 中断风暴」。
+            // 另外不能在 IRQ 模式里再交付（固件若嵌套开中断会造成风暴）。
             var cur: u32 = 0;
             _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cur);
-            if ((cur & 0x80) == 0) {
+            if ((cur & 0x80) == 0 and (cur & 0x1F) != 0x12) {
                 enterIrq(m, engine, @truncate(address));
                 return;
             }
@@ -428,6 +642,21 @@ pub fn onRamF0Write(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, 
         });
     }
     m.ramf0_wr += 1;
+    return true;
+}
+
+/// 关机 magic 变量（0xF03CFE24）的写入者监视
+pub fn onMagicWrite(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: c_int, value: i64, user: ?*anyopaque) callconv(.c) bool {
+    _ = typ;
+    _ = size;
+    const m: *Machine = @ptrCast(@alignCast(user));
+    var pc: u32 = 0;
+    var lr: u32 = 0;
+    _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_PC, &pc);
+    _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_LR, &lr);
+    log.info(@src(), "  [magic写] pc=0x{x:0>8} lr=0x{x:0>8} -> [0x{x:0>8}] = 0x{x:0>8} (instrs={d})", .{
+        pc, lr, address, @as(u64, @bitCast(value)), m.instrs,
+    });
     return true;
 }
 

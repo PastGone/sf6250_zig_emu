@@ -72,11 +72,17 @@ pub const Machine = struct {
     hook_lowram: c.uc_hook = 0,
     hook_ramcode: c.uc_hook = 0,
     lowram_wr: u32 = 0,
-    shutdown_bp: bool = false,
     rampatch_calls: u32 = 0,
     hook_svcwr: c.uc_hook = 0,
     svc_wr: u32 = 0,
     hook_ramf0wr: c.uc_hook = 0,
+    /// 关机检查用的 magic 变量（0xF03CFE24）写监视
+    hook_chkwr: c.uc_hook = 0,
+    /// 启动模式变量（0xF03D004E）写监视：sub_10092E04 读它，必须 == 1 才会
+    /// 去写关机检查用的 magic，否则 MAUI 走关机路径
+    hook_bootwr: c.uc_hook = 0,
+    /// 「CAKE」magic 目标（0x10947980）写监视
+    hook_cakewr: c.uc_hook = 0,
     ramf0_wr: u32 = 0,
     /// 关键地址命中表（装载器/阶段入口，每个只报一次）
     landmark_hit: [landmarks.len]bool = @splat(false),
@@ -170,6 +176,8 @@ pub const Machine = struct {
     irq_count: u32 = 0,
     /// 是否已打印过首次中断确认
     irq_logged: bool = false,
+    /// 固件日志（0x10092b0c）已打印条数（限流）
+    fw_log_n: u32 = 0,
     /// CR 上报路径的轨迹是否已 dump（诊断）
     cr_trace_dumped: bool = false,
     /// 装载原语调用计数（诊断）
@@ -181,6 +189,13 @@ pub const Machine = struct {
     /// IRQ 现场：进入中断时保存，异常返回后恢复
     irq_active: bool = false,
     irq_ret: u32 = 0,
+    /// IRQ 交付后记录的前若干条 PC（诊断：中断后 CPU 到底走了哪条路径——
+    /// 实测 Nucleus 的中断上下文保存/退出点从未被执行，需要看它跑去了哪）
+    irq_trace: [512]u32 = @splat(0),
+    irq_trace_n: usize = 0,
+    /// 异常返回指令（`ldm sp,{...,pc}^`）执行后的模式探针（诊断：Unicorn 是否
+    /// 真的从 SPSR 恢复了 CPSR——实测 CPU 一直卡在 IRQ 模式，怀疑此处缺陷）
+    irq_ret_probe: bool = false,
     irq_saved_regs: [16]u32 = @splat(0),
     irq_saved_cpsr: u32 = 0,
 
@@ -212,15 +227,24 @@ pub const Machine = struct {
     // （它把 0xA0530000 一带称为 “DMA 控制器”，见其 [dma-dump] 探针）。
     // 模型：寄存器文件 + 传输立即完成（读 +0x34 时 bit31 恒置位）。
     xfer_regs: [0x100]u8 = @splat(0),
+    /// 传输引擎寄存器堆（0xA051FF00 起 0x200 字节，覆盖真实基址 0xA051FFE0）
+    xfer_regs2: [0x200]u8 = @splat(0),
+    /// 诊断：DMA 启动后把传输起始地址处补上固件期望的 "CAKE" magic
+    cake_patch: bool = false,
+    /// 诊断：把 flash 窗口也映射为可写（真机若 DMA/固件写 XIP 地址，只读映射
+    /// 会静默吞掉，导致无从判断该地址到底是不是 RAM）
+    flash_rw: bool = false,
     /// 传输引擎寄存器写入次数 / 是否已停止打印现场
     xfer_writes: u32 = 0,
-    xfer_logged: bool = false,
+    /// 传输引擎数据窗口（0xA0521000）写入次数
+    xfer_fifo_writes: u32 = 0,
 
     /// UART 行缓冲上一个字符是 \r（用于把 CRLF 折成一次换行）
     uart_cr: [3]bool = @splat(false),
 
-    /// 末尾执行轨迹（诊断用：看停机/空转前在跑什么）
-    exec_hist: [1024]u32 = @splat(0),
+    /// 末尾执行轨迹（诊断用：看停机/空转前在跑什么）。扩到 4096 条是为了
+    /// 断点处能回溯足够长的调用链（日志分块打印，见 `dumpExecHistTail`）。
+    exec_hist: [4096]u32 = @splat(0),
     exec_hist_pos: usize = 0,
 
     /// 去重后的未映射访问地址（用来反推外设分布）
@@ -250,6 +274,14 @@ pub const Machine = struct {
         try m.eng.hookMem(&m.hook_svcwr, c.UC_HOOK_MEM_WRITE, bootrom.svc_table, bootrom.svc_code + 0x20, diag.onSvcTableWrite, m);
         // 监视 RAMF0 写入：crt0 装载器把驱动/表段搬进来时，第一现场立刻可见
         try m.eng.hookMem(&m.hook_ramf0wr, c.UC_HOOK_MEM_WRITE, map.ramf0_base, map.ramf0_base + map.ramf0_size - 1, diag.onRamF0Write, m);
+        // 关机决策的 magic 变量：MAUI 在 0x100308cc 比较 `*(0xF03CFE24)` 与
+        // 0x26409001，不等就走关机路径。监视它的写入者 = 谁该负责填这个值。
+        try m.eng.hookMem(&m.hook_chkwr, c.UC_HOOK_MEM_WRITE, 0xF03C_FE00, 0xF03C_FEFF, diag.onMagicWrite, m);
+        // 启动模式变量（sub_10092E04 读 `*(u16*)(0xF03D004C+2)`，必须 == 1）
+        try m.eng.hookMem(&m.hook_bootwr, c.UC_HOOK_MEM_WRITE, 0xF03D_0040, 0xF03D_006F, diag.onMagicWrite, m);
+        // 「CAKE」校验目标 0x10947980：固件要求这里是 magic "CAKE"，但静态
+        // flash 里是别的内容。监视写入者 = 谁该负责把它填成 CAKE。
+        try m.eng.hookMem(&m.hook_cakewr, c.UC_HOOK_MEM_WRITE, 0x1094_7000, 0x1094_8000, diag.onMagicWrite, m);
         // 监视 init_dispatch 代码区写入：确认是否有代码被运行时改写
         try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x7000_82E0, 0x7000_8340, diag.onLowRamWrite, m);
         return m;
@@ -307,7 +339,10 @@ pub const Machine = struct {
     /// 依据：MAUI 的 file offset 0x20000 ↔ load_addr 0x10020000，第二段
     /// 0x8752b0 ↔ 0x108752b0，即 flash 被线性映射到 0x1000_0000 起。
     pub fn mapFlashWindow(self: *Machine, img: *const mtk.BootImage) !void {
-        const perms = uc.Perm.combine(&.{ .read, .exec });
+        const perms = if (self.flash_rw)
+            uc.Perm.combine(&.{ .read, .write, .exec })
+        else
+            uc.Perm.combine(&.{ .read, .exec });
 
         try self.eng.memMapPtr(map.flash_window_base, img.data.len, perms, @constCast(img.data.ptr));
         log.info(@src(), "flash 窗口: 0x{x:0>8}..0x{x:0>8} ({d} 字节, 只读可执行)", .{
@@ -399,7 +434,8 @@ pub const Machine = struct {
             // RAMF0 入口页：MAUI 拷进去执行的代码（静态镜像里也没有）
             if (self.ramf0_entry != 0) self.dumpMem(self.ramf0_entry & ~@as(u32, 0xFF));
             // OSTD handler（LISR 11）：只在运行时存在（静态镜像乱码），tick 卡点就在这
-            self.dumpMem(0x7000_9500);
+            self.dumpMem(0x7000_9400);
+            self.dumpMem(0x7000_9680);
             // 低 RAM 0x0 起始页：ARM 异常向量表装在这里（0x18 = IRQ 入口）
             self.dumpMem(0x0000_0000);
             // BootROM/SRAM 蹦床区：MAUI crt0 会从 flash 拷一段到这里（含 IRQ 入口 0x700096B0）
@@ -458,6 +494,51 @@ pub const Machine = struct {
             len += part.len;
         }
         log.info(@src(), "末尾轨迹: {s}", .{buf[0..len]});
+    }
+
+    /// 最近 N 条执行轨迹（从最旧到最新）。日志行过长会被截断，所以断点处
+    /// 用它只打末尾一小段，比 `dumpExecHist`（1024 条）可靠。
+    pub fn dumpExecHistTail(self: *const Machine, n: usize) void {
+        const total = @min(self.exec_hist_pos, self.exec_hist.len);
+        const count = @min(n, total);
+        if (count == 0) return;
+        var tmp: [4096]u32 = undefined;
+        // tmp[0] = 最旧、tmp[count-1] = 最新（打印出来是时间正序）
+        var t: usize = 0;
+        while (t < count) : (t += 1) {
+            tmp[t] = self.exec_hist[(self.exec_hist_pos -% count +% t) % self.exec_hist.len];
+        }
+        var buf: [32 * 10]u8 = undefined;
+        var i: usize = 0;
+        while (i < count) {
+            var len: usize = 0;
+            var j: usize = 0;
+            while (j < 32 and i + j < count) : (j += 1) {
+                const part = std.fmt.bufPrint(buf[len..], "{x:0>8} ", .{tmp[i + j]}) catch break;
+                len += part.len;
+            }
+            if (j == 0) break;
+            log.info(@src(), "末尾轨迹[{d}..{d}]: {s}", .{ i, i + j - 1, buf[0..len] });
+            i += j;
+        }
+    }
+
+    /// 中断交付后记录的 PC 序列，每行 32 条（日志行过长会被截断）
+    pub fn dumpIrqTrace(self: *const Machine) void {
+        if (self.irq_trace_n == 0) return;
+        var buf: [32 * 10]u8 = undefined;
+        var i: usize = 0;
+        while (i < self.irq_trace_n) {
+            var len: usize = 0;
+            var j: usize = 0;
+            while (j < 32 and i + j < self.irq_trace_n) : (j += 1) {
+                const part = std.fmt.bufPrint(buf[len..], "{x:0>8} ", .{self.irq_trace[i + j]}) catch break;
+                len += part.len;
+            }
+            if (j == 0) break;
+            log.info(@src(), "IRQ后轨迹[{d}..{d}]: {s}", .{ i, i + j - 1, buf[0..len] });
+            i += j;
+        }
     }
 
     /// 记下地址；返回 true 表示这是第一次见到

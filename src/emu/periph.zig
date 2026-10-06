@@ -351,23 +351,40 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         leWrite(self.chip_regs[0..], addr - 0xA000_0000, size, value);
         return;
     }
-    // 传输/DMA 引擎（0xA0520000）：寄存器文件；+0x34 的 bit31 在读取时置位
-    if (addr >= 0xA052_0000 and addr < 0xA052_0100) {
-        const off = addr - 0xA052_0000;
-        // 引擎的「描述符」寄存器写入是定位搬运源/目标的关键，前 40 次全部记现场
-        if (!self.xfer_logged and self.xfer_writes < 40) {
+    // ── 诊断开关 --cake-patch ──────────────────────────────────────────
+    // 固件在 DMA 启动后校验传输起始地址（+0x00 配置）处的 magic == "CAKE"
+    // （0x10032714 `cmp`，不等就 assert → 关机）。真机这个值由传输引擎搬运/
+    // 解扰产生，我们没实现该硬件行为，先用固件自己的期望值补上，用来验证
+    // 「这是不是唯一的卡点」。正式修法是实现 0xA0520000 的真实传输。
+    if (self.cake_patch and addr == 0xA052_0080 and value == 1) {
+        const dst = leRead(self.xfer_regs2[0..], 0x100, 4);
+        _ = c.uc_mem_write(self.eng.handle, dst, "CAKE", 4);
+        log.info(@src(), "  [cake-patch] DMA 启动 → 起始 0x{x:0>8} 写入 \"CAKE\"", .{dst});
+    }
+    // 传输/DMA 引擎（0xA0520000）：寄存器文件；+0x34 的 bit31 在读取时置位。
+    // 注意实际基址是 0xA051FFE0（固件把 r4 先 +0x20 再用），所以范围向下扩。
+    if (addr >= 0xA051_FF00 and addr < 0xA052_0100) {
+        const off = addr - 0xA051_FF00;
+        // 引擎的「描述符」寄存器写入是定位搬运源/目标的关键，前 80 次全部记现场
+        if (self.xfer_writes < 400) {
             const site = accessSite(self);
-            log.info(@src(), "  [传输引擎] 写 +0x{x:0>3} = 0x{x:0>8} size={d} pc=0x{x:0>8} lr=0x{x:0>8}", .{
-                off, value, size, site.pc, site.lr,
+            log.info(@src(), "  [传输引擎] 写 0x{x:0>8} = 0x{x:0>8} size={d} pc=0x{x:0>8} lr=0x{x:0>8}", .{
+                addr, value, size, site.pc, site.lr,
             });
         }
         self.xfer_writes += 1;
-        leWrite(self.xfer_regs[0..], off, size, value);
+        leWrite(self.xfer_regs2[0..], off, size, value);
         return;
     }
     if (addr >= 0xA052_1000 and addr < 0xA053_0000) {
-        // +0x1000 起看起来是数据窗口（MAUI 会成片写 0xA0521000.. ），只记次数
-        self.xfer_writes += 1;
+        // 数据窗口：固件先往这里成片写数据、再启动 DMA——内容就是搬运的源数据
+        self.xfer_fifo_writes += 1;
+        if (self.xfer_fifo_writes <= 64) {
+            const site = accessSite(self);
+            log.info(@src(), "  [DMA-FIFO] 写 0x{x:0>8} = 0x{x:0>8} size={d} pc=0x{x:0>8}", .{
+                addr, value, size, site.pc,
+            });
+        }
         return;
     }
 
