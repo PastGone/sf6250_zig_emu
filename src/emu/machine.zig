@@ -82,6 +82,7 @@ pub const Machine = struct {
     bp_logged: bool = false,
     bp_bss: bool = false,
     bp_brlyt: bool = false,
+    shutdown_bp: bool = false,
     bss_calls: u32 = 0,
     bss_last_r0: u32 = 0,
     bss_last_r1: u32 = 0,
