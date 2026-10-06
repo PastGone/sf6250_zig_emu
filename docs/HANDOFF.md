@@ -308,6 +308,25 @@ addr:0x1007BD14 ... Memory dump is disabled! ...
 | `--trace` | 每条指令打 DEBUG（很慢） |
 | `--lcd` | 开 SDL 窗口并进事件循环 |
 
+## 9.5 最新状态（2026-10-07，MAUI 端到端跑通）
+
+- **BL → BL2 → MAUI → 关机序列已端到端跑通**：`--tick=50000` 下 MAUI 越过
+  0x1007064C 等待，跑到 main() 尾部关机（0xA0030008=0x1971 →
+  sub_10037A84(1) → 0x1002e38a `b .`）。日志里能看到 ALICE_1 断言输出
+  （alice.c 检查点，打印后继续）
+- 中断体系已逆向并实现手工交付（`--tick=N --tick-irq=11`）：IRQ 入口
+  0x700096B0 是 MAUI crt0 拷来的**固件自己的代码**（勿合成覆盖）；
+  交付前必须查 CPSR.I，SPSR 写入前必须先切 IRQ 模式（两个实测坑）
+- RAM 补丁区 0xF0700000+（BootROM 服务）已实现宿主侧拦截
+  （`onRamPatchExec`：清 CPSR.I + 返回 0）；veneer 表 101 个目标全部
+  bit0=1（Thumb），ARMv5TE Thumb 无法自改 CPSR → 只能模拟器侧做
+- **下一层问题**：MAUI 为何走到关机——ALICE_1 断言（0x1002AE90 ←
+  reset handler）与 OSTD 超时（0x1007064C 自旋→超时→CR 链）两条线；
+  目标 = 让 OS 调度器持续运转（手机保持开机）
+- OSTD 硬件 0xA01F0040 已接线（LISR 11 处理器的寄存器基址）；处理器
+  运行时码只在运行时存在（静态乱码），停机 dump 已含 0x70009500
+- 机器拆分已按 REFACTOR.md 完成（machine/periph/diag/bootrom 四文件）
+
 ## 10. 提交纪律
 
 每个里程碑一个 commit，消息里写「实测」段落——这是下一个人最宝贵的上下文。
