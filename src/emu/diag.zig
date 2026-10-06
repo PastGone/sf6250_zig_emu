@@ -284,6 +284,19 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
 
     // ── 周期 tick 与中断交付（Unicorn 没有注入中断的 API，这里手工模拟
     //    ARM 的 IRQ 异常入口/返回；见 docs/mt6250-wiring.md「中断」一节）──
+    // memcpy 到 DMA FIFO 的调用点（0x100325e8 `blx 0x10070570`）：
+    // memcpy(r0=dst, r1=src, r2=len)。抓出来确认「搬什么、从哪、多大」。
+    if (address == 0x1003_25e8) {
+        var r0: u32 = 0;
+        var r1: u32 = 0;
+        var r2: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &r0);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &r1);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R2, &r2);
+        log.info(@src(), "  [FIFO拷贝] memcpy(dst=0x{x:0>8}, src=0x{x:0>8}, len=0x{x}({d}))", .{
+            r0, r1, r2, r2,
+        });
+    }
     // 传输引擎操作函数（0x10032670 起，r4 = 寄存器基址）：确认基址到底是多少
     if (address == 0x1003_2670 or address == 0x1003_26ec) {
         var r4: u32 = 0;

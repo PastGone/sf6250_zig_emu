@@ -236,8 +236,17 @@ pub const Machine = struct {
     flash_rw: bool = false,
     /// 传输引擎寄存器写入次数 / 是否已停止打印现场
     xfer_writes: u32 = 0,
+    /// 传输/解压引擎（0xA0530000）寄存器堆。BL(0x10008994) 与 MAUI
+    /// (sub_1003A448) 都用：+0x00 状态(16位位域)、+0x04 命令(3=复位, 19=触发)、
+    /// +0x08~+0x24 参数、+0x2C 状态。真实行为（触发后如何变换数据）待补。
+    xfer2_regs: [0x100]u8 = @splat(0),
+    /// 传输引擎数据窗口（0xA0521000 起）内容：固件 memcpy 源数据进来，再启动
+    /// DMA 搬走。保存它才能看清「搬的到底是什么」
+    xfer_fifo: [0x2000]u8 = @splat(0),
     /// 传输引擎数据窗口（0xA0521000）写入次数
     xfer_fifo_writes: u32 = 0,
+    /// 传输/解压引擎（0xA0530000）写入次数
+    xfer2_writes: u32 = 0,
 
     /// UART 行缓冲上一个字符是 \r（用于把 CRLF 折成一次换行）
     uart_cr: [3]bool = @splat(false),

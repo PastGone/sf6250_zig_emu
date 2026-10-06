@@ -111,6 +111,10 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     if (addr >= 0xA000_0000 and addr < 0xA000_0010) {
         return leRead(self.chip_regs[0..], addr - 0xA000_0000, size);
     }
+    // 传输/解压引擎（0xA0530000）：寄存器文件（见 onMmioWrite 同区块注释）
+    if (addr >= 0xA053_0000 and addr < 0xA053_0100) {
+        return leRead(self.xfer2_regs[0..], addr - 0xA053_0000, size);
+    }
     // 传输/DMA 引擎（0xA0520000）：见 xfer_regs 字段注释
     if (addr >= 0xA052_0000 and addr < 0xA052_0100) {
         var v = leRead(self.xfer_regs[0..], addr - 0xA052_0000, size);
@@ -351,15 +355,35 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         leWrite(self.chip_regs[0..], addr - 0xA000_0000, size, value);
         return;
     }
-    // ── 诊断开关 --cake-patch ──────────────────────────────────────────
-    // 固件在 DMA 启动后校验传输起始地址（+0x00 配置）处的 magic == "CAKE"
-    // （0x10032714 `cmp`，不等就 assert → 关机）。真机这个值由传输引擎搬运/
-    // 解扰产生，我们没实现该硬件行为，先用固件自己的期望值补上，用来验证
-    // 「这是不是唯一的卡点」。正式修法是实现 0xA0520000 的真实传输。
-    if (self.cake_patch and addr == 0xA052_0080 and value == 1) {
-        const dst = leRead(self.xfer_regs2[0..], 0x100, 4);
-        _ = c.uc_mem_write(self.eng.handle, dst, "CAKE", 4);
-        log.info(@src(), "  [cake-patch] DMA 启动 → 起始 0x{x:0>8} 写入 \"CAKE\"", .{dst});
+    // ── DMA 启动（+0x80 写 1）──────────────────────────────────────────
+    // 固件先把源数据 memcpy 进 FIFO（0xA0521000），再写 +0x80 的 bit0 启动。
+    // 把 FIFO 内容打出来，就能确认「这一趟到底搬的是什么」。
+    if (addr == 0xA052_0080 and (value & 1) != 0) {
+        dumpFifo(self, 0);
+        dumpFifo(self, 32);
+        // 诊断开关 --cake-patch：用固件自己的期望值补上 magic，验证这是不是
+        // 唯一卡点。正式修法是实现真实搬运，到时删掉这个分支。
+        if (self.cake_patch) {
+            const dst = leRead(self.xfer_regs2[0..], 0x100, 4);
+            _ = c.uc_mem_write(self.eng.handle, dst, "CAKE", 4);
+            log.info(@src(), "  [cake-patch] DMA 启动 → 起始 0x{x:0>8} 写入 \"CAKE\"", .{dst});
+        }
+    }
+    // 传输/解压引擎（0xA0530000）：BL(0x10008994) 与 MAUI(sub_1003A448) 共用。
+    // +0x00 状态(16位位域)、+0x04 命令(3=复位、19=触发)、+0x08~+0x24 参数、
+    // +0x2C 状态。先接成寄存器文件并记现场；触发后的数据变换（固件随后校验
+    // 目标处 == "CAKE"）需要还原私有算法后再补。
+    if (addr >= 0xA053_0000 and addr < 0xA053_0100) {
+        const off = addr - 0xA053_0000;
+        if (self.xfer2_writes < 60) {
+            const site = accessSite(self);
+            log.info(@src(), "  [引擎2] 写 +0x{x:0>3} = 0x{x:0>8} pc=0x{x:0>8} lr=0x{x:0>8}", .{
+                off, value, site.pc, site.lr,
+            });
+        }
+        self.xfer2_writes += 1;
+        leWrite(self.xfer2_regs[0..], off, size, value);
+        return;
     }
     // 传输/DMA 引擎（0xA0520000）：寄存器文件；+0x34 的 bit31 在读取时置位。
     // 注意实际基址是 0xA051FFE0（固件把 r4 先 +0x20 再用），所以范围向下扩。
@@ -376,8 +400,10 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         leWrite(self.xfer_regs2[0..], off, size, value);
         return;
     }
-    if (addr >= 0xA052_1000 and addr < 0xA053_0000) {
-        // 数据窗口：固件先往这里成片写数据、再启动 DMA——内容就是搬运的源数据
+    if (addr >= 0xA052_1000 and addr < 0xA052_3000) {
+        // 数据窗口：固件 memcpy 源数据进来、再启动 DMA——内容就是搬运的源数据
+        const off = addr - 0xA052_1000;
+        leWrite(self.xfer_fifo[0..], off, size, value);
         self.xfer_fifo_writes += 1;
         if (self.xfer_fifo_writes <= 64) {
             const site = accessSite(self);
@@ -401,6 +427,18 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
 pub fn onMmioRead(_: ?*c.uc_engine, offset: u64, size: c_uint, user: ?*anyopaque) callconv(.c) u64 {
     const ctx: *RegionCtx = @ptrCast(@alignCast(user.?));
     return periphRead(ctx.machine, @truncate(ctx.base + offset), size);
+}
+
+/// dump 传输引擎 FIFO（0xA0521000）的 32 字节——启动 DMA 时的源数据
+fn dumpFifo(self: *const Machine, base: usize) void {
+    var line: [128]u8 = undefined;
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        const part = std.fmt.bufPrint(line[len..], "{x:0>2} ", .{self.xfer_fifo[base + i]}) catch break;
+        len += part.len;
+    }
+    log.info(@src(), "  [DMA源] fifo+0x{x:0>2}: {s}", .{ base, line[0..len] });
 }
 
 pub fn onMmioWrite(_: ?*c.uc_engine, offset: u64, size: c_uint, value: u64, user: ?*anyopaque) callconv(.c) void {
