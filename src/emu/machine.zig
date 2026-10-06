@@ -269,6 +269,16 @@ pub const Machine = struct {
     a070_regs: [0x1000]u8 = @splat(0),
     a051_regs: [0x1000]u8 = @splat(0),
     a054_regs: [0x1000]u8 = @splat(0),
+    /// PWM（0xA00E0000）：数据手册 GPIO/定时器复用章。作为独立 PWM 模块接成寄存器
+    /// 文件（输出不做建模，配置可回读）。与 ACCDET 的 PWM 子单元共用设计，但基地址不同。
+    pwm_regs: [0x1000]u8 = @splat(0),
+    /// ACCDET 配件检测（0xA0750000）：数据手册 1.1 章（Base +A0750000h）。全是 R/W
+    /// 控制寄存器（RSTB/CTRL/STATE_SWCTRL/PWM_WIDTH/PWM_THRESH/DEBOUNCE…），无「读到
+    /// 0 即致命」的只读位——无配件插入时读 0 是合理默认。接成寄存器文件。
+    accdet_regs: [0x100]u8 = @splat(0),
+    /// MSDC SD 控制器（0xA0130000）：数据手册存储章。寄存器文件（无卡时状态位
+    /// 读 0 = 空闲，固件走「无卡」路径）。配置可回读。
+    msdc_regs: [0x1000]u8 = @splat(0),
     /// EMI/总线命令（0xA0180080 起）：BL 服务(0x70008F94) 用它发命令、等 bit31、
     /// 并做时序校准（读 +0xA8/+0xAC）。整块接成寄存器文件，特殊位返回合理值。
     emi_regs: [0x100]u8 = @splat(0),

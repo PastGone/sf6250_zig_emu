@@ -23,7 +23,10 @@ pub const known_regions = [_]struct { base: u32, name: []const u8 }{
     .{ .base = 0xA014_0000, .name = "SF(串行flash)" },
     .{ .base = 0xA018_0000, .name = "EMI/总线命令" },
     .{ .base = 0xA00C_0000, .name = "GPT(通用定时器)" },
+    .{ .base = 0xA00E_0000, .name = "PWM" },
+    .{ .base = 0xA013_0000, .name = "MSDC(SD控制器)" },
     .{ .base = 0xA015_0000, .name = "AUXADC(辅助ADC)" },
+    .{ .base = 0xA075_0000, .name = "ACCDET(配件检测)" },
     .{ .base = 0xA019_0000, .name = "HIF0(主机接口)" },
     .{ .base = 0xA01A_0000, .name = "HIF1(主机接口)" },
     .{ .base = 0xA01B_0000, .name = "NLI_ARB(外部存储接口仲裁)" },
@@ -194,6 +197,11 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     if (addr >= 0xA003_0000 and addr < 0xA003_0100) return leRead(self.a003_regs[0..], addr - 0xA003_0000, size);
     if (addr >= 0xA001_0000 and addr < 0xA001_0400) return leRead(self.a001_regs[0..], addr - 0xA001_0000, size);
     if (addr >= 0xA073_0000 and addr < 0xA073_1000) return leRead(self.acfg_regs[0..], addr - 0xA073_0000, size);
+    // PWM（0xA00E0000）/ MSDC（0xA0130000）/ ACCDET（0xA0750000）：寄存器文件，
+    // 见 §字段注释（数据手册均有章节；无卡/无配件时读 0 是合理默认）。
+    if (addr >= 0xA00E_0000 and addr < 0xA00E_1000) return leRead(self.pwm_regs[0..], addr - 0xA00E_0000, size);
+    if (addr >= 0xA013_0000 and addr < 0xA013_1000) return leRead(self.msdc_regs[0..], addr - 0xA013_0000, size);
+    if (addr >= 0xA075_0000 and addr < 0xA075_0100) return leRead(self.accdet_regs[0..], addr - 0xA075_0000, size);
     // 传输/DMA 引擎（0xA0520000）：见 xfer_regs 字段注释
     if (addr >= 0xA052_0000 and addr < 0xA052_0100) {
         var v = leRead(self.xfer_regs[0..], addr - 0xA052_0000, size);
@@ -528,6 +536,9 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
     if (addr >= 0xA003_0000 and addr < 0xA003_0100) { leWrite(self.a003_regs[0..], addr - 0xA003_0000, size, value); return; }
     if (addr >= 0xA001_0000 and addr < 0xA001_0400) { leWrite(self.a001_regs[0..], addr - 0xA001_0000, size, value); return; }
     if (addr >= 0xA073_0000 and addr < 0xA073_1000) { leWrite(self.acfg_regs[0..], addr - 0xA073_0000, size, value); return; }
+    if (addr >= 0xA00E_0000 and addr < 0xA00E_1000) { leWrite(self.pwm_regs[0..], addr - 0xA00E_0000, size, value); return; }
+    if (addr >= 0xA013_0000 and addr < 0xA013_1000) { leWrite(self.msdc_regs[0..], addr - 0xA013_0000, size, value); return; }
+    if (addr >= 0xA075_0000 and addr < 0xA075_0100) { leWrite(self.accdet_regs[0..], addr - 0xA075_0000, size, value); return; }
     // 传输/DMA 引擎（0xA0520000）：寄存器文件；+0x34 的 bit31 在读取时置位。
     // 注意实际基址是 0xA051FFE0（固件把 r4 先 +0x20 再用），所以范围向下扩。
     if (addr >= 0xA051_FF00 and addr < 0xA052_0100) {
