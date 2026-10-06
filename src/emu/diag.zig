@@ -298,6 +298,14 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
             m.irq_active = false;
         }
     } else {
+        // MAUI 关机自旋（0x1002e38a）：首次到达时 dump 轨迹，回溯关机决策
+        if (address == 0x1002_e38a and !m.shutdown_bp) {
+            m.shutdown_bp = true;
+            var lr: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+            log.info(@src(), "  [关机] 到达 0x1002e38a 自旋, lr=0x{x:0>8} (instrs={d})", .{ lr, m.instrs });
+            m.dumpExecHist();
+        }
         if (m.tick_interval != 0 and m.instrs >= m.next_tick) {
             m.next_tick = m.instrs + m.tick_interval;
             // 只按 OS 是否使能过来决定：0xA0030000 bit0（全局，sub_10037A84 置位）

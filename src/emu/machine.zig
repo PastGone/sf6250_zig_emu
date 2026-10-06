@@ -72,6 +72,7 @@ pub const Machine = struct {
     hook_lowram: c.uc_hook = 0,
     hook_ramcode: c.uc_hook = 0,
     lowram_wr: u32 = 0,
+    shutdown_bp: bool = false,
     rampatch_calls: u32 = 0,
     hook_svcwr: c.uc_hook = 0,
     svc_wr: u32 = 0,
