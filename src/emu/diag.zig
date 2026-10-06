@@ -65,6 +65,29 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
             m.last_r10 = r10;
         }
     }
+    // 装载原语 sub_100023F0（SRAM 0x70009BF0）的调用现场：r0=dst r1=src r2=size。
+    // 这是 BL/ExtBL 通用镜像装载器（IDA: sub_10001678 里调它），把每一段的
+    // 搬运目标/长度直接打出来，用来回答「0xF07xxxxx 到底谁搬」。
+    if (address == 0x7000_9BF0 and m.loader_calls < 40) {
+        m.loader_calls += 1;
+        var d: u32 = 0;
+        var src: u32 = 0;
+        var sz: u32 = 0;
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R0, &d);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R1, &src);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_R2, &sz);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [装载] dst=0x{x:0>8} src=0x{x:0>8} size=0x{x} lr=0x{x:0>8} (instrs={d})", .{
+            d, src, sz, lr, m.instrs,
+        });
+    }
+    // CR 上报入口（0x100283E0）：dump 之前 1024 条 PC，看是谁把 MAUI 逼进
+    // 崩溃处理链的（这条链上的 RAM 补丁代码 0xF072BD7C 在本镜像里不存在）
+    if (address == 0x100283E0 and !m.cr_trace_dumped) {
+        m.cr_trace_dumped = true;
+        m.dumpExecHist();
+    }
     // 关键地址命中（装载器等）：每个地址只报一次
     inline for (machine.landmarks, 0..) |lm, li| {
         if (address == lm and !m.landmark_hit[li]) {

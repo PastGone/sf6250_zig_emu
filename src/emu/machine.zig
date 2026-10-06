@@ -48,6 +48,10 @@ const max_faults = 768;
 /// 地址做「RAMF0 是否被装载」的判据（见其 [loader] 探针）。
 pub const landmarks = [_]u32{
     0x100c347c, 0x100c3508, 0x100c353c, 0x100c3570,
+    // MAUI 早期流程地标（参考实现 run761 的说法：0x10020488 是 OS init 链入口，
+    // 0x7000A800 是 crt0 拷到 SRAM 的内核入口，内核从那里 bx 过去执行）
+    0x100203ac, 0x10020488, 0x7000a800, 0x10022a40,
+    0x100283e0,
 };
 
 pub const Machine = struct {
@@ -162,6 +166,10 @@ pub const Machine = struct {
     irq_count: u32 = 0,
     /// 是否已打印过首次中断确认
     irq_logged: bool = false,
+    /// CR 上报路径的轨迹是否已 dump（诊断）
+    cr_trace_dumped: bool = false,
+    /// 装载原语调用计数（诊断）
+    loader_calls: u32 = 0,
     /// CPSR.I 采样跟踪（诊断：固件到底有没有开 CPU 中断）
     i_bit_last: bool = true,
     /// 采样上限（避免刷屏）
