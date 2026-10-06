@@ -22,8 +22,21 @@ pub const known_regions = [_]struct { base: u32, name: []const u8 }{
     .{ .base = 0xA008_0000, .name = "UART3(LOG)" },
     .{ .base = 0xA014_0000, .name = "SF(串行flash)" },
     .{ .base = 0xA018_0000, .name = "EMI/总线命令" },
+    .{ .base = 0xA00C_0000, .name = "GPT(通用定时器)" },
+    .{ .base = 0xA015_0000, .name = "AUXADC(辅助ADC)" },
+    .{ .base = 0xA019_0000, .name = "HIF0(主机接口)" },
+    .{ .base = 0xA01A_0000, .name = "HIF1(主机接口)" },
+    .{ .base = 0xA01B_0000, .name = "NLI_ARB(外部存储接口仲裁)" },
     .{ .base = 0xA01F_0000, .name = "OSTD(OS timer)" },
     .{ .base = 0xA045_0000, .name = "LCM" },
+    .{ .base = 0xA002_0000, .name = "A002 GPIO/CLK" },
+    .{ .base = 0xA017_0000, .name = "A017(文档未覆盖)" },
+    .{ .base = 0xA01C_0000, .name = "A01C(文档未覆盖)" },
+    .{ .base = 0xA003_0000, .name = "中断控制器" },
+    .{ .base = 0xA001_0000, .name = "A001(文档未覆盖)" },
+    .{ .base = 0xA051_0000, .name = "A051(文档未覆盖)" },
+    .{ .base = 0xA054_0000, .name = "A054(文档未覆盖)" },
+    .{ .base = 0xA070_0000, .name = "A070(文档未覆盖)" },
     .{ .base = 0xA071_0000, .name = "RTC" },
     .{ .base = 0xA073_0000, .name = "ACFG GPIO" },
 };
@@ -85,26 +98,30 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     }
     // PLL 锁定状态：bit1=锁定（BL 0x7000868e 轮询；写 0xA0050300/0x308 配置后等它）
     if (addr == 0xA005_0318) return 0x2;
-    // EMI 时序测量（0xA01800A8 = 起始计数 / +0xAC = 结束计数）。
-    // 依据：BL sub_70008F94（MAUI 会通过 0x70008E2C 回调它）发命令 0x11 后读这
-    // 两个寄存器做 EMI 校准，伪代码要求
-    //   26*(AC-A8) + (HIBYTE(AC)-HIBYTE(A8)) - 1301 < 599
-    // （偏移 dword_70009000 = -1301、阈值 dword_70009004 = 599，均为实测）
-    // ⇒ 差值需落在 [51,73]。此前两者都返回 0，触发 `if (v4<=v3) v4+=0x1000000`
-    // 让差值炸成 16M，校准永远失败、跑满 80000 次循环（= 52 万次 EMI 访问）。
-    if (addr == 0xA018_00A8) return 0x00; // 起始计数
-    if (addr == 0xA018_00AC) return 0x3C; // 结束计数（60，落在 [51,73] 内）
-    // EMI/总线命令状态：bit0=0（命令已完成，BL 0x70008FA8 轮询的位）。
-    // MAUI 也会来读（实测 52 万次！），前几次记现场以便反查它到底在等哪个位。
-    if (addr == 0xA018_00A0) {
-        if (self.emi_reads < 10) {
-            const site = accessSite(self);
-            log.info(@src(), "  [EMI读] pc=0x{x:0>8} lr=0x{x:0>8} size={d} -> 0", .{
-                site.pc, site.lr, size,
-            });
+    // CLK/PLL 配置寄存器（0xA0050000 起）：整块接成寄存器文件（见 onMmioWrite 同区块注释）
+    if (addr >= 0xA005_0000 and addr < 0xA005_1000) {
+        return leRead(self.clk_regs[0..], addr - 0xA005_0000, size);
+    }
+    // EMI/总线命令（0xA0180080 起，整块接成寄存器文件）。
+    // 依据见 HANDOFF §9.8 / wiring 文档：BL sub_70008F94 用它发命令、等 bit31，
+    // 并读 +0xA8/+0xAC 做时序校准（伪代码要求差值落在 [51,73]，dword_70009000
+    // = -1301、阈值 dword_70009004 = 599 均为实测）。此前只接了 0xA01800A0 单点，
+    // 实际基址是 0xA0180080（还有 +0x80/+0x88/+0xA4 等寄存器）。
+    if (addr >= 0xA018_0080 and addr < 0xA018_00C0) {
+        const off = addr - 0xA018_0000;
+        if (off == 0xA0) { // 命令/状态位：busy 位（bit0/bit31）读恒 0 = 已完成
+            if (self.emi_reads < 10) {
+                const site = accessSite(self);
+                log.info(@src(), "  [EMI读] +0x{x:0>2} pc=0x{x:0>8} lr=0x{x:0>8} size={d} -> 0", .{
+                    off, site.pc, site.lr, size,
+                });
+            }
+            self.emi_reads += 1;
+            return 0x00;
         }
-        self.emi_reads += 1;
-        return 0x00;
+        if (off == 0xA8) return 0x00; // 校准起始计数
+        if (off == 0xAC) return 0x3C; // 结束计数（60，落在 [51,73] 内）
+        return leRead(self.emi_regs[0..], off, size);
     }
     // 中断全局控制（0xA0030000/08）：回读保留（MAUI sub_10037A84 读改写）
     if (addr == 0xA003_0000) return self.intc_ctrl;
@@ -112,6 +129,37 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     // 串行 flash 控制器（SF，0xA0140000）：控制/状态 + 数据窗口两个区段
     if ((addr >= 0xA014_0000 and addr < 0xA014_0100) or (addr >= 0xA014_0800 and addr < 0xA014_0810)) {
         return sfcRead(self, addr - 0xA014_0000, size);
+    }
+    // AUXADC 辅助 ADC（0xA0150000）：DAT0~DAT11 是只读采样值（低 10 位有效）。
+    // 数据手册只给寄存器图，采样值按「电池正常、没插充电器、常温」给合理默认，
+    // 免得固件读到 0 误判成低电/无电池而关机。
+    if (addr >= 0xA015_0000 and addr < 0xA015_0100) {
+        const off = addr - 0xA015_0000;
+        return switch (off) {
+            0x10 => 0x2A4, // DAT0 VBAT ≈ 3.7V（10-bit，参考 2.8V 半分压）
+            0x14 => 0x000, // DAT1 ISENSE 无充电电流
+            0x18 => 0x000, // DAT2 CHRIN 未接充电器
+            0x1C => 0x180, // DAT3 VBATTMP 常温
+            else => leRead(self.auxadc_regs[0..], off, size),
+        };
+    }
+    // GPT 通用定时器（0xA00C0000）：寄存器文件。STA(+0x10) 回 0 = 无超时事件
+    if (addr >= 0xA00C_0000 and addr < 0xA00C_0040) {
+        return leRead(self.gpt_regs[0..], addr - 0xA00C_0000, size);
+    }
+    // HIF0/HIF1 主机接口（0xA0190000 / 0xA01A0000，数据手册 4.16 章）：
+    // 寄存器文件 + 数据窗口；STA(+0x00) 的 bit0=BUSY 恒 0（空闲）
+    if (addr >= 0xA019_0000 and addr < 0xA019_0400) {
+        return leRead(self.hif_regs[0..], addr - 0xA019_0000, size);
+    }
+    if (addr >= 0xA01A_0000 and addr < 0xA01A_0400) {
+        return leRead(self.hif1_regs[0..], addr - 0xA01A_0000, size);
+    }
+    // NLI_ARB 外部存储器接口仲裁（0xA01B0000）：寄存器文件，CS(+0x14) 用复位值
+    if (addr >= 0xA01B_0000 and addr < 0xA01B_0100) {
+        const off = addr - 0xA01B_0000;
+        if (off == 0x14) return self.nli_cs;
+        return leRead(self.nli_regs[0..], off, size);
     }
     // RTC（0xA0710000）：寄存器文件，写入值读回（数据手册 RTC 章）
     if (addr >= 0xA071_0000 and addr < 0xA071_0100) {
@@ -130,10 +178,22 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     if (addr >= 0xA000_0000 and addr < 0xA000_0010) {
         return leRead(self.chip_regs[0..], addr - 0xA000_0000, size);
     }
-    // 传输/解压引擎（0xA0530000）：寄存器文件（见 onMmioWrite 同区块注释）
-    if (addr >= 0xA053_0000 and addr < 0xA053_0100) {
+    // 传输/解压引擎（0xA0530000）+ 数据窗口：寄存器文件（见 onMmioWrite 同区块注释）
+    if (addr >= 0xA053_0000 and addr < 0xA053_2000) {
         return leRead(self.xfer2_regs[0..], addr - 0xA053_0000, size);
     }
+    // 以下为「已确认外设但语义未深究」的寄存器文件块（读写一致即可，不伪造硬件
+    // 行为）。ACFG GPIO(0xA0730000)/A002 GPIO-CLK(0xA0020000) 数据手册有章节；
+    // A017/A051/A054/A070 文档(1/2/3.md)未覆盖，先黑盒接上、语义记 HANDOFF 待查。
+    if (addr >= 0xA002_0000 and addr < 0xA002_1000) return leRead(self.a002_regs[0..], addr - 0xA002_0000, size);
+    if (addr >= 0xA017_0000 and addr < 0xA017_1000) return leRead(self.a017_regs[0..], addr - 0xA017_0000, size);
+    if (addr >= 0xA051_0000 and addr < 0xA051_1000) return leRead(self.a051_regs[0..], addr - 0xA051_0000, size);
+    if (addr >= 0xA054_0000 and addr < 0xA054_1000) return leRead(self.a054_regs[0..], addr - 0xA054_0000, size);
+    if (addr >= 0xA070_0000 and addr < 0xA070_1000) return leRead(self.a070_regs[0..], addr - 0xA070_0000, size);
+    if (addr >= 0xA01C_0000 and addr < 0xA01C_0200) return leRead(self.a01c_regs[0..], addr - 0xA01C_0000, size);
+    if (addr >= 0xA003_0000 and addr < 0xA003_0100) return leRead(self.a003_regs[0..], addr - 0xA003_0000, size);
+    if (addr >= 0xA001_0000 and addr < 0xA001_0400) return leRead(self.a001_regs[0..], addr - 0xA001_0000, size);
+    if (addr >= 0xA073_0000 and addr < 0xA073_1000) return leRead(self.acfg_regs[0..], addr - 0xA073_0000, size);
     // 传输/DMA 引擎（0xA0520000）：见 xfer_regs 字段注释
     if (addr >= 0xA052_0000 and addr < 0xA052_0100) {
         var v = leRead(self.xfer_regs[0..], addr - 0xA052_0000, size);
@@ -146,6 +206,9 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
         const off = addr & 0xFFFF;
         if (off == 0x14) return 0x60; // LSR：THRE|TEMT（发送器空闲）
         if (off == 0x00) return 0x00; // RBR：无接收数据
+        // 其余 UART 寄存器（IER/IIR/LCR/MCR/MSR/中断使能等）：黑盒返回 0，
+        // 不再进故障表——这些是各 UART 共用的标准寄存器，读 0 是「空闲/无中断」态。
+        return 0;
     }
 
     if (self.recordFault(addr, "read")) {
@@ -320,26 +383,60 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
             }
             return;
         }
+        return; // 其余 UART 寄存器写忽略（不进故障表，黑盒建模）
     }
     if (addr == 0xA005_0090) { // 时钟切换命令
-        if (self.recordFault(addr, "clk-cmd")) {
-            log.info(@src(), "  时钟切换命令 write 0x{x}", .{value});
-        }
+        log.info(@src(), "  时钟切换命令 write 0x{x}", .{value});
         self.clk_cmd = @truncate(value);
         return;
     }
-    if (addr == 0xA018_00A0) { // EMI/总线命令：busy 位写后自清
-        if (self.emi_writes < 20) {
-            log.info(@src(), "  [EMI写] =0x{x} pc=0x{x:0>8} lr=0x{x:0>8}", .{
-                value, accessSite(self).pc, accessSite(self).lr,
-            });
+    // CLK/PLL 配置寄存器写（整块寄存器文件，0xA0050090 命令点已在上面特判）
+    if (addr >= 0xA005_0000 and addr < 0xA005_1000) {
+        leWrite(self.clk_regs[0..], addr - 0xA005_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA018_0080 and addr < 0xA018_00C0) { // EMI/总线命令整块
+        const off = addr - 0xA018_0000;
+        if (off == 0xA0) { // 命令/状态：busy 位写后自清 + 首次命令触发 0x0 重映射
+            if (self.emi_writes < 20) {
+                log.info(@src(), "  [EMI写] +0x{x:0>2} =0x{x} pc=0x{x:0>8} lr=0x{x:0>8}", .{
+                    off, value, accessSite(self).pc, accessSite(self).lr,
+                });
+            }
+            self.emi_writes += 1;
+            // 首次总线命令触发的 0x0 重映射（模拟器扮演 BootROM 的部分）在 bootrom.zig
+            if (!self.remaped_low_ram) bootrom.onBusCommand(self);
+            leWrite(self.emi_regs[0..], off, size, 0); // 写后清零（busy=0）
+            return;
         }
-        self.emi_writes += 1;
-        if (self.recordFault(addr, "emi-cmd")) {
-            log.info(@src(), "  EMI 总线命令 write 0x{x}（busy 自清）", .{value});
+        leWrite(self.emi_regs[0..], off, size, value);
+        return;
+    }
+    // AUXADC / GPT / HIF / NLI_ARB 写侧：一律寄存器文件（写入值可读回），
+    // 固件做的配置才不会丢。AUXADC 的 DAT* 是只读采样值，读侧会覆盖掉。
+    if (addr >= 0xA015_0000 and addr < 0xA015_0100) {
+        leWrite(self.auxadc_regs[0..], addr - 0xA015_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA00C_0000 and addr < 0xA00C_0040) {
+        leWrite(self.gpt_regs[0..], addr - 0xA00C_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA019_0000 and addr < 0xA019_0400) {
+        leWrite(self.hif_regs[0..], addr - 0xA019_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA01A_0000 and addr < 0xA01A_0400) {
+        leWrite(self.hif1_regs[0..], addr - 0xA01A_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA01B_0000 and addr < 0xA01B_0100) {
+        const off = addr - 0xA01B_0000;
+        if (off == 0x14) { // NLI_ARB_CS
+            self.nli_cs = @truncate(value);
+            return;
         }
-        // 首次总线命令触发的 0x0 重映射（模拟器扮演 BootROM 的部分）在 bootrom.zig
-        if (!self.remaped_low_ram) bootrom.onBusCommand(self);
+        leWrite(self.nli_regs[0..], off, size, value);
         return;
     }
     // 串行 flash 控制器（SF）与 RTC 的写侧
@@ -403,13 +500,14 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
             log.info(@src(), "  [cake-patch] DMA 启动 → 起始 0x{x:0>8} 写入 \"CAKE\"", .{dst});
         }
     }
-    // 传输/解压引擎（0xA0530000）：BL(0x10008994) 与 MAUI(sub_1003A448) 共用。
-    // +0x00 状态(16位位域)、+0x04 命令(3=复位、19=触发)、+0x08~+0x24 参数、
-    // +0x2C 状态。先接成寄存器文件并记现场；触发后的数据变换（固件随后校验
-    // 目标处 == "CAKE"）需要还原私有算法后再补。
-    if (addr >= 0xA053_0000 and addr < 0xA053_0100) {
+    // 传输/解压引擎（0xA0530000）+ 数据窗口（0xA0531000 起）：BL(0x10008994)
+    // 与 MAUI(sub_1003A448) 共用。+0x00 状态(16位位域)、+0x04 命令(3=复位、
+    // 19=触发)、+0x08~+0x24 参数、+0x2C 状态；+0x1000 起是数据窗口。
+    // 先接成寄存器文件并记现场；触发后的数据变换（固件随后校验目标处 ==
+    // "CAKE"）需要还原私有算法后再补。
+    if (addr >= 0xA053_0000 and addr < 0xA053_2000) {
         const off = addr - 0xA053_0000;
-        if (self.xfer2_writes < 60) {
+        if (off < 0x100 and self.xfer2_writes < 60) {
             const site = accessSite(self);
             log.info(@src(), "  [引擎2] 写 +0x{x:0>3} = 0x{x:0>8} pc=0x{x:0>8} lr=0x{x:0>8}", .{
                 off, value, site.pc, site.lr,
@@ -419,6 +517,17 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         leWrite(self.xfer2_regs[0..], off, size, value);
         return;
     }
+    // 以下寄存器文件块（读侧已加）：ACFG GPIO / A002 GPIO-CLK / A017 / A051 / A054 /
+    // A070。统一「写入值可读回」，固件配置不丢；不伪造任何硬件行为。
+    if (addr >= 0xA002_0000 and addr < 0xA002_1000) { leWrite(self.a002_regs[0..], addr - 0xA002_0000, size, value); return; }
+    if (addr >= 0xA017_0000 and addr < 0xA017_1000) { leWrite(self.a017_regs[0..], addr - 0xA017_0000, size, value); return; }
+    if (addr >= 0xA051_0000 and addr < 0xA051_1000) { leWrite(self.a051_regs[0..], addr - 0xA051_0000, size, value); return; }
+    if (addr >= 0xA054_0000 and addr < 0xA054_1000) { leWrite(self.a054_regs[0..], addr - 0xA054_0000, size, value); return; }
+    if (addr >= 0xA070_0000 and addr < 0xA070_1000) { leWrite(self.a070_regs[0..], addr - 0xA070_0000, size, value); return; }
+    if (addr >= 0xA01C_0000 and addr < 0xA01C_0200) { leWrite(self.a01c_regs[0..], addr - 0xA01C_0000, size, value); return; }
+    if (addr >= 0xA003_0000 and addr < 0xA003_0100) { leWrite(self.a003_regs[0..], addr - 0xA003_0000, size, value); return; }
+    if (addr >= 0xA001_0000 and addr < 0xA001_0400) { leWrite(self.a001_regs[0..], addr - 0xA001_0000, size, value); return; }
+    if (addr >= 0xA073_0000 and addr < 0xA073_1000) { leWrite(self.acfg_regs[0..], addr - 0xA073_0000, size, value); return; }
     // 传输/DMA 引擎（0xA0520000）：寄存器文件；+0x34 的 bit31 在读取时置位。
     // 注意实际基址是 0xA051FFE0（固件把 r4 先 +0x20 再用），所以范围向下扩。
     if (addr >= 0xA051_FF00 and addr < 0xA052_0100) {

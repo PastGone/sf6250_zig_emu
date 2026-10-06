@@ -229,6 +229,20 @@ pub const Machine = struct {
     xfer_regs: [0x100]u8 = @splat(0),
     /// 传输引擎寄存器堆（0xA051FF00 起 0x200 字节，覆盖真实基址 0xA051FFE0）
     xfer_regs2: [0x200]u8 = @splat(0),
+    /// AUXADC 辅助 ADC（0xA0150000）：10-bit，DAT0=VBAT/1=ISENSE/2=CHRIN/
+    /// 3=VBATTMP。数据手册只给寄存器图，采样值靠合理默认（见 periph.zig）
+    auxadc_regs: [0x100]u8 = @splat(0),
+    /// GPT 通用定时器（0xA00C0000）：GPT1~3 走 32k 时钟、GPT4 走 26M
+    /// CON 的 bit15=EN / bit14=MODE(0 单次 / 1 自动重装载)
+    gpt_regs: [0x40]u8 = @splat(0),
+    /// HIF0 / HIF1 主机接口（0xA0190000 / 0xA01A0000）：数据手册 4.16 章
+    hif_regs: [0x400]u8 = @splat(0),
+    hif1_regs: [0x400]u8 = @splat(0),
+    /// NLI_ARB 外部存储器接口仲裁（0xA01B0000）：数据手册 3.md
+    nli_regs: [0x100]u8 = @splat(0),
+    /// NLI_ARB_CS 复位值：FAVOR_NORMAL=1(bit16)、LPCE3B_SEL=001(bit12)、
+    /// LPCE2B_SEL=100(bit8)、LPCE1B_SEL=011(bit4)、LPCE0B_SEL=000
+    nli_cs: u32 = 0x0001_1430,
     /// 诊断：DMA 启动时真的把 FIFO 搬到 +0x00 目标（判别是否 1:1 搬运）
     dma_copy: bool = false,
     /// 诊断：DMA 启动后把传输起始地址处补上固件期望的 "CAKE" magic
@@ -238,10 +252,33 @@ pub const Machine = struct {
     flash_rw: bool = false,
     /// 传输引擎寄存器写入次数 / 是否已停止打印现场
     xfer_writes: u32 = 0,
-    /// 传输/解压引擎（0xA0530000）寄存器堆。BL(0x10008994) 与 MAUI
-    /// (sub_1003A448) 都用：+0x00 状态(16位位域)、+0x04 命令(3=复位, 19=触发)、
-    /// +0x08~+0x24 参数、+0x2C 状态。真实行为（触发后如何变换数据）待补。
-    xfer2_regs: [0x100]u8 = @splat(0),
+    /// 传输/解压引擎（0xA0530000）寄存器堆 + 数据窗口（0xA0531000 起）。
+    /// BL(0x10008994) 与 MAUI(sub_1003A448) 都用：+0x00 状态(16位位域)、
+    /// +0x04 命令(3=复位, 19=触发)、+0x08~+0x24 参数、+0x2C 状态、+0x1000 起
+    /// 是数据窗口（故障表里一直未接线）。真实行为（触发后如何变换数据）待补。
+    xfer2_regs: [0x2000]u8 = @splat(0),
+    /// ACFG GPIO（0xA0730000，数据手册 GPIO 章）+ A002 GPIO/CLK（0xA0020000）。
+    /// 这两块之前只列在 known_regions（仅命名）却无读写分支，所以一直未接线。
+    acfg_regs: [0x1000]u8 = @splat(0),
+    a002_regs: [0x1000]u8 = @splat(0),
+    /// 以下三块文档（1/2/3.md）未覆盖，但固件会访问：按保守寄存器文件接（读写
+    /// 一致即可，不伪造硬件行为）。语义需后续拿文档或反编译确认，记在 HANDOFF。
+    a017_regs: [0x1000]u8 = @splat(0),
+    a070_regs: [0x1000]u8 = @splat(0),
+    a051_regs: [0x1000]u8 = @splat(0),
+    a054_regs: [0x1000]u8 = @splat(0),
+    /// EMI/总线命令（0xA0180080 起）：BL 服务(0x70008F94) 用它发命令、等 bit31、
+    /// 并做时序校准（读 +0xA8/+0xAC）。整块接成寄存器文件，特殊位返回合理值。
+    emi_regs: [0x100]u8 = @splat(0),
+    /// CLK/PLL 配置（0xA0050000 起）：除 0x090(时钟切换命令)/0x318(PLL 锁定) 两
+    /// 个特判点外，整块接成寄存器文件（时钟配置写入可回读，不伪造锁定状态）。
+    clk_regs: [0x1000]u8 = @splat(0),
+    /// A01C（文档未覆盖）：固件会访问（0xA01C0000 起），黑盒寄存器文件。
+    a01c_regs: [0x200]u8 = @splat(0),
+    /// 中断控制器（0xA0030000，除 0x0000/0x0008 特判外整块寄存器文件）与
+    /// 新段 A001（文档未覆盖）：均黑盒寄存器文件。
+    a003_regs: [0x100]u8 = @splat(0),
+    a001_regs: [0x400]u8 = @splat(0),
     /// 传输引擎数据窗口（0xA0521000 起）内容：固件 memcpy 源数据进来，再启动
     /// DMA 搬走。保存它才能看清「搬的到底是什么」
     xfer_fifo: [0x2000]u8 = @splat(0),
