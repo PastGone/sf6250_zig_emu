@@ -85,8 +85,27 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     }
     // PLL 锁定状态：bit1=锁定（BL 0x7000868e 轮询；写 0xA0050300/0x308 配置后等它）
     if (addr == 0xA005_0318) return 0x2;
-    // EMI/总线命令状态：bit0=0（命令已完成，BL 0x70008FA8 轮询的位）
-    if (addr == 0xA018_00A0) return 0x00;
+    // EMI 时序测量（0xA01800A8 = 起始计数 / +0xAC = 结束计数）。
+    // 依据：BL sub_70008F94（MAUI 会通过 0x70008E2C 回调它）发命令 0x11 后读这
+    // 两个寄存器做 EMI 校准，伪代码要求
+    //   26*(AC-A8) + (HIBYTE(AC)-HIBYTE(A8)) - 1301 < 599
+    // （偏移 dword_70009000 = -1301、阈值 dword_70009004 = 599，均为实测）
+    // ⇒ 差值需落在 [51,73]。此前两者都返回 0，触发 `if (v4<=v3) v4+=0x1000000`
+    // 让差值炸成 16M，校准永远失败、跑满 80000 次循环（= 52 万次 EMI 访问）。
+    if (addr == 0xA018_00A8) return 0x00; // 起始计数
+    if (addr == 0xA018_00AC) return 0x3C; // 结束计数（60，落在 [51,73] 内）
+    // EMI/总线命令状态：bit0=0（命令已完成，BL 0x70008FA8 轮询的位）。
+    // MAUI 也会来读（实测 52 万次！），前几次记现场以便反查它到底在等哪个位。
+    if (addr == 0xA018_00A0) {
+        if (self.emi_reads < 10) {
+            const site = accessSite(self);
+            log.info(@src(), "  [EMI读] pc=0x{x:0>8} lr=0x{x:0>8} size={d} -> 0", .{
+                site.pc, site.lr, size,
+            });
+        }
+        self.emi_reads += 1;
+        return 0x00;
+    }
     // 中断全局控制（0xA0030000/08）：回读保留（MAUI sub_10037A84 读改写）
     if (addr == 0xA003_0000) return self.intc_ctrl;
     if (addr == 0xA003_0008) return self.intc_ctrl8;
@@ -310,6 +329,12 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         return;
     }
     if (addr == 0xA018_00A0) { // EMI/总线命令：busy 位写后自清
+        if (self.emi_writes < 20) {
+            log.info(@src(), "  [EMI写] =0x{x} pc=0x{x:0>8} lr=0x{x:0>8}", .{
+                value, accessSite(self).pc, accessSite(self).lr,
+            });
+        }
+        self.emi_writes += 1;
         if (self.recordFault(addr, "emi-cmd")) {
             log.info(@src(), "  EMI 总线命令 write 0x{x}（busy 自清）", .{value});
         }

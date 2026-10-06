@@ -247,6 +247,11 @@ pub const Machine = struct {
     xfer_fifo_writes: u32 = 0,
     /// 传输/解压引擎（0xA0530000）写入次数
     xfer2_writes: u32 = 0,
+    /// EMI 总线命令（0xA01800A0）读/写次数（诊断：MAUI 实测轮询 52 万次）
+    emi_reads: u32 = 0,
+    emi_writes: u32 = 0,
+    /// 是否已 dump 过 BL 的 SRAM 区（运行时代码与静态镜像不一致）
+    sram_dumped: bool = false,
 
     /// UART 行缓冲上一个字符是 \r（用于把 CRLF 折成一次换行）
     uart_cr: [3]bool = @splat(false),
