@@ -10,6 +10,7 @@ const uc = @import("unicorn.zig");
 const c = uc.c;
 const machine = @import("machine.zig");
 const Machine = machine.Machine;
+const map = machine.map;
 const bootrom = @import("bootrom.zig");
 
 pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque) callconv(.c) void {
@@ -62,6 +63,15 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
                 log.info(@src(), "  [r10变化] pc=0x{x:0>8} sl: 0x{x:0>8} → 0x{x:0>8} (instrs={d})", .{ address, m.last_r10, r10, m.instrs });
             }
             m.last_r10 = r10;
+        }
+    }
+    // 关键地址命中（装载器等）：每个地址只报一次
+    inline for (machine.landmarks, 0..) |lm, li| {
+        if (address == lm and !m.landmark_hit[li]) {
+            m.landmark_hit[li] = true;
+            var lr: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+            log.info(@src(), "  [地标] pc=0x{x:0>8} lr=0x{x:0>8} (instrs={d})", .{ address, lr, m.instrs });
         }
     }
     if (m.instrs < 16) {
@@ -143,6 +153,64 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
     if (address == 0x1002_0300) {
         log.info(@src(), "★ 阶段切换: 进入 MAUI (0x10020301, 取指 0x10020300)", .{});
     }
+    // RAMF0（0xF0000000）里第一次执行：MAUI 会把代码拷进 RAMF0 再经 ARM veneer
+    // （XIP 0x10078cd8 起）跳进去跑，记录入口地址以便停机时 dump
+    if (address >= map.ramf0_base and address < map.ramf0_base + map.ramf0_size and m.ramf0_entry == 0) {
+        m.ramf0_entry = @truncate(address);
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [RAMF0执行] 首次在 RAMF0 取指 pc=0x{x:0>8} lr=0x{x:0>8} (instrs={d})", .{
+            address, lr, m.instrs,
+        });
+    }
+    // --ramf0-lr：RAM 补丁区未装载时的诊断旁路（等价 bx lr），见字段注释
+    if (m.ramf0_lr and address >= 0xf070_0000 and address < 0xf080_0000) {
+        var lr: u32 = 0;
+        var cpsr: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_CPSR, &cpsr);
+        cpsr = (cpsr & ~@as(u32, 0x20)) | ((lr & 1) << 5);
+        var newpc: u32 = lr & ~@as(u32, 1);
+        _ = c.uc_reg_write(engine, c.UC_ARM_REG_PC, &newpc);
+        _ = c.uc_reg_write(engine, c.UC_ARM_REG_CPSR, &cpsr);
+        if (!m.ramf0_slide) {
+            m.ramf0_slide = true;
+            log.info(@src(), "  [RAM补丁旁路] pc=0x{x:0>8} 未装载 → 等价 bx lr 到 0x{x:0>8} (instrs={d})", .{
+                address, newpc, m.instrs,
+            });
+        }
+        return;
+    }
+    // RAMF0 里「第一次取到全零指令」= 滑行起点（跳错地址/跑飞后 Thumb 0x0000 = NOP）。
+    // 这条日志的第一现场能直接指出是谁跳进来的（lr/sp + 末尾轨迹）。
+    if (address >= map.ramf0_base and address < map.ramf0_base + map.ramf0_size and !m.ramf0_slide) {
+        var word: [4]u8 = undefined;
+        if (c.uc_mem_read(engine, address, &word, word.len) == c.UC_ERR_OK and
+            std.mem.eql(u8, &word, &[_]u8{ 0, 0, 0, 0 }))
+        {
+            m.ramf0_slide = true;
+            var lr: u32 = 0;
+            var sp: u32 = 0;
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+            _ = c.uc_reg_read(engine, c.UC_ARM_REG_SP, &sp);
+            log.info(@src(), "  [RAMF0滑行] 取到零指令 pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} (instrs={d})", .{
+                address, lr, sp, m.instrs,
+            });
+            m.dumpExecHist();
+        }
+    }
+    // 第一次在低 RAM（EMI 重映射后的 0x0 区）0x1000 以上取指：说明有代码被拷进
+    // RAM 执行（MAUI 的早期搬运阶段），这是「静态镜像里没有的代码」的来源线索
+    if (address >= 0x1000 and address < 0x0010_0000 and !m.low_ram_entered) {
+        m.low_ram_entered = true;
+        var lr: u32 = 0;
+        var sp: u32 = 0;
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_LR, &lr);
+        _ = c.uc_reg_read(engine, c.UC_ARM_REG_SP, &sp);
+        log.info(@src(), "  [低RAM执行] 首次在 0x0 区 >0x1000 取指 pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} (instrs={d})", .{
+            address, lr, sp, m.instrs,
+        });
+    }
     if (address == 0x700082e0) {
         m.init_entries += 1;
         if (m.init_entries <= 8 or m.init_entries % 64 == 0) {
@@ -176,6 +244,25 @@ pub fn onCode(engine: ?*c.uc_engine, address: u64, size: u32, user: ?*anyopaque)
     if (m.trace) {
         log.debug(@src(), "pc=0x{x:0>8} size={d}", .{ address, size });
     }
+}
+
+/// RAMF0 写监视：crt0 装载器把驱动/表段搬进 OS 数据区时抓第一现场（前 16 次）
+pub fn onRamF0Write(uc_engine: ?*c.uc_engine, typ: c.uc_mem_type, address: u64, size: c_int, value: i64, user: ?*anyopaque) callconv(.c) bool {
+    _ = typ;
+    const m: *Machine = @ptrCast(@alignCast(user));
+    // 只关心 0xF0700000+ 的「RAM 代码区」（veneer 表 0x10078cd8 的目标都在这里）；
+    // 0xF03Bxxxx/0xF05Exxxx 是 crt0 搬的数据/表段，先不刷屏
+    if (address >= 0xf070_0000 and address < 0xf080_0000 and m.ramf0_wr < 16) {
+        var pc: u32 = 0;
+        var lr: u32 = 0;
+        _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_PC, &pc);
+        _ = c.uc_reg_read(uc_engine, c.UC_ARM_REG_LR, &lr);
+        log.info(@src(), "  [RAMF0写] pc=0x{x:0>8} lr=0x{x:0>8} -> [0x{x:0>8}] = 0x{x} size={d}", .{
+            pc, lr, address, @as(u64, @bitCast(value)), size,
+        });
+    }
+    m.ramf0_wr += 1;
+    return true;
 }
 
 /// 回调表写监视：记录 PC 与写入值（前 32 次）

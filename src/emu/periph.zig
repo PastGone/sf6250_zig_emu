@@ -13,6 +13,8 @@ const bootrom = @import("bootrom.zig");
 
 /// 已接线的寄存器区块（地址→名字）。行为依据见 docs/mt6250-wiring.md。
 pub const known_regions = [_]struct { base: u32, name: []const u8 }{
+    .{ .base = 0xA000_0000, .name = "CHIP-ID/启动模式" },
+    .{ .base = 0xA052_0000, .name = "传输/DMA引擎" },
     .{ .base = 0xA005_0000, .name = "CLK/PLL" },
     .{ .base = 0xA006_0000, .name = "UART1(AT)" },
     .{ .base = 0xA007_0000, .name = "UART2" },
@@ -45,14 +47,25 @@ pub const RegionCtx = struct {
     base: u64,
 };
 
-/// 固件串口输出：存进行缓冲，\n / \r / 满行时按行打出
+/// 固件串口输出：存进行缓冲，行终止时按行打出。
+/// \r\n 折成一次换行（否则每行会多出一条空日志）。
 fn uartPutc(self: *Machine, i: usize, b: u8) void {
-    const printable = (b >= 0x20 and b < 0x7f) or b == '\t';
-    if (self.uart_len[i] < 120) {
-        self.uart_line[i][self.uart_len[i]] = if (printable) b else '?';
-        self.uart_len[i] += 1;
+    if (b == '\r' or b == '\n') {
+        if (b == '\n' and self.uart_cr[i]) {
+            self.uart_cr[i] = false; // CRLF 的后半个，已换过行
+            return;
+        }
+        self.uart_cr[i] = (b == '\r');
+        if (self.uart_len[i] > 0) {
+            log.info(@src(), "[UART{d} TX] {s}", .{ i + 1, self.uart_line[i][0..self.uart_len[i]] });
+            self.uart_len[i] = 0;
+        }
+        return;
     }
-    if (b == '\n' or b == '\r' or self.uart_len[i] >= 120) {
+    const printable = (b >= 0x20 and b < 0x7f) or b == '\t';
+    self.uart_line[i][self.uart_len[i]] = if (printable) b else '?';
+    self.uart_len[i] += 1;
+    if (self.uart_len[i] >= 120) {
         log.info(@src(), "[UART{d} TX] {s}", .{ i + 1, self.uart_line[i][0..self.uart_len[i]] });
         self.uart_len[i] = 0;
     }
@@ -79,6 +92,17 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     // RTC（0xA0710000）：寄存器文件，写入值读回（数据手册 RTC 章）
     if (addr >= 0xA071_0000 and addr < 0xA071_0100) {
         return leRead(self.rtc_regs[0..], addr - 0xA071_0000, size);
+    }
+    // 芯片标识/启动模式寄存器（0xA0000000）：见 chip_regs 字段注释
+    if (addr >= 0xA000_0000 and addr < 0xA000_0010) {
+        return leRead(self.chip_regs[0..], addr - 0xA000_0000, size);
+    }
+    // 传输/DMA 引擎（0xA0520000）：见 xfer_regs 字段注释
+    if (addr >= 0xA052_0000 and addr < 0xA052_0100) {
+        var v = leRead(self.xfer_regs[0..], addr - 0xA052_0000, size);
+        // +0x34 的 bit31 = 传输完成（固件写启动位后等它置位）
+        if (addr - 0xA052_0000 == 0x34) v |= 0x8000_0000;
+        return v;
     }
 
     if (uartIndex(addr) != null) {
@@ -130,19 +154,36 @@ fn leWrite(buf: []u8, off: u32, size: u32, value: u64) void {
     }
 }
 
-/// SF（串行 flash）控制器寄存器读。位语义由固件轮询序列反推：
+/// SF（串行 flash）控制器寄存器读。位语义全部由固件轮询序列反推：
 ///   +0x00 bit0=忙（本模型恒 0）、bit1=命令完成（= bit2&bit3 同时为 1）、
-///         bit2/bit3/bit4=固件写的控制位（回读保留）
-///   +0x04 状态标志、+0x10 命令字节数、+0x14 响应字节数、+0x800 起数据窗口
+///         bit2/bit3/bit4=固件写的控制位（回读保留）        ← BL2 驱动
+///   +0x04 状态标志（bit0 参与 +0x00 bit4 判定）
+///   +0x08 bit8=命令完成                                  ← MAUI 驱动
+///   +0x10 命令字节数、+0x14 响应字节数
+///   +0x40/+0x44 控制 bank：bit9|bit10 = 启动，bit13 = 完成 ← MAUI 驱动
+///   +0x800 起数据窗口（命令/地址在前，响应从 [len] 开始）
+///
+/// BL2 的驱动（XIP 0x1000d702/0x1000d752）只碰 +0x00/+0x04/+0x10/+0x14/+0x800；
+/// MAUI 的驱动（XIP 0x10859fd8/0x1085a03e，运行时拷到低 RAM 0x00000e00 执行）
+/// 额外碰 +0x08/+0x40/+0x44/+0x804。两处都实测过轮询序列。
 fn sfcRead(self: *Machine, off: u32, size: u32) u64 {
     if (off == 0x00) {
         const done: u32 = if (self.sfc_ctrl & 0xC == 0xC) 0x2 else 0;
         return (self.sfc_ctrl & ~@as(u32, 0x3)) | done;
     }
     if (off == 0x04) return self.sfc_flags;
+    if (off == 0x08) {
+        const done2: u32 = if (self.sfc_ctrl2 & 0x600 == 0x600) 0x100 else 0;
+        return (self.sfc_status8 & ~@as(u32, 0x100)) | done2;
+    }
     if (off == 0x10) return self.sfc_len;
     if (off == 0x14) return self.sfc_mode;
-    if (off >= 0x800 and off < 0x804) return leRead(self.sfc_fifo[0..], off - 0x800, size);
+    if (off == 0x40) return self.sfc_ctrl_a;
+    if (off == 0x44) {
+        const done2: u32 = if (self.sfc_ctrl2 & 0x600 == 0x600) 0x2000 else 0;
+        return (self.sfc_ctrl2 & ~@as(u32, 0x2000)) | done2;
+    }
+    if (off >= 0x800 and off < 0x800 + self.sfc_fifo.len) return leRead(self.sfc_fifo[0..], off - 0x800, size);
     return 0;
 }
 
@@ -157,6 +198,10 @@ fn sfcWrite(self: *Machine, off: u32, size: u32, value: u64) void {
         self.sfc_flags = @truncate(value);
         return;
     }
+    if (off == 0x08) {
+        self.sfc_status8 = @truncate(value);
+        return;
+    }
     if (off == 0x10) {
         self.sfc_len = @truncate(value);
         return;
@@ -165,7 +210,15 @@ fn sfcWrite(self: *Machine, off: u32, size: u32, value: u64) void {
         self.sfc_mode = @truncate(value);
         return;
     }
-    if (off >= 0x800 and off < 0x804) {
+    if (off == 0x40) {
+        self.sfc_ctrl_a = @truncate(value);
+        return;
+    }
+    if (off == 0x44) {
+        self.sfc_ctrl2 = @truncate(value);
+        return;
+    }
+    if (off >= 0x800 and off < 0x800 + self.sfc_fifo.len) {
         leWrite(self.sfc_fifo[0..], off - 0x800, size, value);
         return;
     }
@@ -237,6 +290,30 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
     }
     if (addr >= 0xA071_0000 and addr < 0xA071_0100) {
         leWrite(self.rtc_regs[0..], addr - 0xA071_0000, size, value);
+        return;
+    }
+    // 芯片标识寄存器组：也接受写入（真机是只读 eFuse，固件不会写；留着便于调试）
+    if (addr >= 0xA000_0000 and addr < 0xA000_0010) {
+        leWrite(self.chip_regs[0..], addr - 0xA000_0000, size, value);
+        return;
+    }
+    // 传输/DMA 引擎（0xA0520000）：寄存器文件；+0x34 的 bit31 在读取时置位
+    if (addr >= 0xA052_0000 and addr < 0xA052_0100) {
+        const off = addr - 0xA052_0000;
+        // 引擎的「描述符」寄存器写入是定位搬运源/目标的关键，前 40 次全部记现场
+        if (!self.xfer_logged and self.xfer_writes < 40) {
+            const site = accessSite(self);
+            log.info(@src(), "  [传输引擎] 写 +0x{x:0>3} = 0x{x:0>8} size={d} pc=0x{x:0>8} lr=0x{x:0>8}", .{
+                off, value, size, site.pc, site.lr,
+            });
+        }
+        self.xfer_writes += 1;
+        leWrite(self.xfer_regs[0..], off, size, value);
+        return;
+    }
+    if (addr >= 0xA052_1000 and addr < 0xA053_0000) {
+        // +0x1000 起看起来是数据窗口（MAUI 会成片写 0xA0521000.. ），只记次数
+        self.xfer_writes += 1;
         return;
     }
 

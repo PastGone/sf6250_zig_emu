@@ -56,6 +56,8 @@ pub fn main(init: std.process.Init) !void {
     defer mach.deinit();
     mach.trace = hasArg(args, "--trace");
     mach.lenient = hasArg(args, "--lenient");
+    // 诊断：MAUI 的 RAM 补丁代码区（0xf07xxxxx）在本镜像里无人装载，见字段注释
+    mach.ramf0_lr = hasArg(args, "--ramf0-lr");
 
     mach.loadBootloader(&fw.image) catch |err| {
         log.err(@src(), "failed to load bootloader (rc={s})", .{@errorName(err)});
@@ -67,6 +69,11 @@ pub fn main(init: std.process.Init) !void {
     };
     mach.mapExternalRam() catch |err| {
         log.err(@src(), "failed to map external RAM (rc={s})", .{@errorName(err)});
+        return;
+    };
+    // MAUI 的 OS 数据区（0xF0000000 起 8MB）：就绪标志/调度栈都在这里
+    mach.mapRamF0() catch |err| {
+        log.err(@src(), "failed to map RAMF0 (rc={s})", .{@errorName(err)});
         return;
     };
     // 外设层常驻：已接线寄存器给行为，其余读 0/写丢弃并记名

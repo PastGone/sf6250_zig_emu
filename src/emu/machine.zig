@@ -36,9 +36,19 @@ pub const map = struct {
     pub const apb_size = 0x200_0000;
     pub const ahb_base = 0xa000_0000;
     pub const ahb_size = 0x1000_0000;
+
+    /// RAMF0：OS 数据区（run761 内存图；就绪标志 0xF05DDF64、调度栈 0xF0424000）
+    pub const ramf0_base = 0xf000_0000;
+    pub const ramf0_size = 0x0080_0000;
 };
 
-const max_faults = 256;
+const max_faults = 768;
+
+/// 关键地址（命中即报一次）：MAUI crt0 装载器入口——参考实现 run761 用同样的
+/// 地址做「RAMF0 是否被装载」的判据（见其 [loader] 探针）。
+pub const landmarks = [_]u32{
+    0x100c347c, 0x100c3508, 0x100c353c, 0x100c3570,
+};
 
 pub const Machine = struct {
     allocator: std.mem.Allocator,
@@ -59,6 +69,10 @@ pub const Machine = struct {
     lowram_wr: u32 = 0,
     hook_svcwr: c.uc_hook = 0,
     svc_wr: u32 = 0,
+    hook_ramf0wr: c.uc_hook = 0,
+    ramf0_wr: u32 = 0,
+    /// 关键地址命中表（装载器/阶段入口，每个只报一次）
+    landmark_hit: [landmarks.len]bool = @splat(false),
     bp_logged: bool = false,
     bp_bss: bool = false,
     bp_brlyt: bool = false,
@@ -70,6 +84,19 @@ pub const Machine = struct {
     wild_jumped: bool = false,
     stack_exec: bool = false,
     flash_entered: bool = false,
+    /// 是否已在低 RAM（EMI 重映射后的 0x0 区）执行过拷进去的代码
+    low_ram_entered: bool = false,
+    /// RAMF0（0xF0000000）里第一次执行到的地址（MAUI 会把代码拷进去跑）
+    ramf0_entry: u32 = 0,
+    /// 是否已抓到「跳进 RAMF0 顶部零区」的第一现场
+    ramf0_slide: bool = false,
+    /// --ramf0-lr：诊断开关。MAUI 的 XIP 代码用静态 veneer 表（XIP 0x10078c78+）
+    /// 调用 0xf0727000~0xf072c2cd 的「RAM 补丁代码」，但实测**没有任何装载器**
+    /// 写过该区域（BL/BL2 里连该地址范围的字面量都没有；MAUI crt0 的段表也不含
+    /// 它；运行时写监视零命中）——所以取指必然拿到 0x0000 并滑到 RAMF0 顶端。
+    /// 打开后遇到该区域取指就等价于 `bx lr`（参考实现 run761 run539 也是这么
+    /// 处理「RAM 区域被误执行」的），用来判断这段代码是不是必经之路。
+    ramf0_lr: bool = false,
     /// 进入 BL2 入口 / init_dispatch 的次数（判断「阶段交接」还是「重启循环」）
     bl2_entries: u32 = 0,
     init_entries: u32 = 0,
@@ -82,20 +109,29 @@ pub const Machine = struct {
     clk_cmd: u32 = 0,
 
     // ── 串行 flash 控制器（SF，0xA0140000）──────────────────────────────
-    // 依据：BL2 的 flash 识别流程（XIP 0x1000a8b4 → 0x1000d968 → 0x1000d890）。
-    // 固件把「命令字节」写进数据窗口 0xA0140800，长度写 +0x10，**读回字节数**写
-    // +0x14（不是命令！0x1000d8c2 存的是第 4 个参数），随后写 0xA0140000
-    // bit2|bit3 启动，轮询 bit1=完成、bit0=空闲。
+    // 依据：两代驱动的实测轮询序列
+    //  - BL2（XIP 0x1000d890/0x1000d702）：数据窗口写命令，+0x10 写长度，
+    //    +0x14 写**读回字节数**（不是命令！0x1000d8c2 存的是第 4 个参数），
+    //    +0x00 写 bit2|bit3 启动，轮询 bit1=完成、bit0=空闲
+    //  - MAUI（XIP 0x10859fd8/0x1085a03e，运行时拷到低 RAM 0x00000e00 跑）：
+    //    +0x44 写 bit9|bit10 启动并轮询 bit13=完成，另轮询 +0x08 bit8=完成
     /// +0x00 控制/状态（bit2|bit3 同时置位 = 命令完成，bit0 = 忙）
     sfc_ctrl: u32 = 0,
     /// +0x04 状态位（bit0 参与固件对 +0x00 bit4 的判定）
     sfc_flags: u32 = 0,
+    /// +0x08 状态位（bit8 = MAUI 驱动的命令完成位）
+    sfc_status8: u32 = 0,
+    /// +0x40 控制 bank 低半（MAUI 驱动只写不读，回读保留）
+    sfc_ctrl_a: u32 = 0,
+    /// +0x44 控制 bank 高半（bit9|bit10 = 命令进行中 → bit13 = 完成）
+    sfc_ctrl2: u32 = 0,
     /// +0x10 写进数据窗口的命令字节数（命令 + 地址）
     sfc_len: u32 = 0,
     /// +0x14 命令后要读回的响应字节数
     sfc_mode: u32 = 0,
-    /// +0x800 起 4 字节数据窗口：[0..len) = 命令/地址，[len..) = 响应
-    sfc_fifo: [4]u8 = @splat(0),
+    /// +0x800 起数据窗口：[0..len) = 命令/地址，[len..) = 响应
+    /// （MAUI 驱动会写到 +0x804，所以留 8 字节）
+    sfc_fifo: [8]u8 = @splat(0),
     /// 已执行的 SF 命令数（日志限流用）
     sfc_cmds_run: u32 = 0,
     /// 各命令字节的累计次数（run 结束打印，看 BL2 到底在干什么）
@@ -106,6 +142,35 @@ pub const Machine = struct {
     // 寄存器文件语义 = 写入值读回（固件每写一个值就轮询读回比对）。
     /// RTC 寄存器堆（0x00~0xFF，16 位寄存器，冷启动全 0）
     rtc_regs: [0x100]u8 = @splat(0),
+
+    // ── 芯片标识/启动模式寄存器（0xA0000000）────────────────────────────
+    // 依据（两处固件行为 + 参考实现 run761 独立结论一致）：
+    //  - MAUI 芯片识别函数 XIP 0x10033338 读 +0x00/+0x08（16 位）：
+    //    +0x08 必须等于 0x625A（代码 0x6218 + 0x42，即 "6250A" = MT6250A），
+    //    否则一路 branch 到 0x1003346e 比对失败 → 死循环刷
+    //    "# HW=MT0000 , SW=MT625"
+    //  - BL2 启动模式检查 XIP 0x1000a15c 读 +0x04 低字节：bit7=0 → 返回 0
+    //    （调用点 0x100098c6 按返回值分流）
+    //  - 成功路径还会把 +0x04 低字节按 "Chip SW second version: %02d" 打出来
+    chip_regs: [0x10]u8 = .{
+        0x50, 0x62, 0x00, 0x00, // +0x00 芯片 ID = 0x6250 (MT6250)
+        0x00, 0x00, 0x00, 0x00, // +0x04 启动模式/second version = 0
+        0x5A, 0x62, 0x00, 0x00, // +0x08 芯片版本 = 0x625A (MT6250A)
+        0x00, 0x00, 0x00, 0x00,
+    },
+    // ── 传输/DMA 引擎（0xA0520000）──────────────────────────────────────
+    // 依据：MAUI XIP 0x1003267a~0x100326fa 的实测序列——写参数到 +0x08、
+    // 控制位到 +0x80/+0x84（bit0 启动），写长度到 +0x3C，写启动位到 +0x34，
+    // 然后轮询 +0x34 的 bit31 = 传输完成。参考实现 run761 独立得到同一结论
+    // （它把 0xA0530000 一带称为 “DMA 控制器”，见其 [dma-dump] 探针）。
+    // 模型：寄存器文件 + 传输立即完成（读 +0x34 时 bit31 恒置位）。
+    xfer_regs: [0x100]u8 = @splat(0),
+    /// 传输引擎寄存器写入次数 / 是否已停止打印现场
+    xfer_writes: u32 = 0,
+    xfer_logged: bool = false,
+
+    /// UART 行缓冲上一个字符是 \r（用于把 CRLF 折成一次换行）
+    uart_cr: [3]bool = @splat(false),
 
     /// 末尾执行轨迹（诊断用：看停机/空转前在跑什么）
     exec_hist: [1024]u32 = @splat(0),
@@ -134,6 +199,8 @@ pub const Machine = struct {
         try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x0, 0xFFFF, diag.onLowRamWrite, m);
         // 监视服务表+服务代码写入：谁改写了我们登记的服务指针/代码
         try m.eng.hookMem(&m.hook_svcwr, c.UC_HOOK_MEM_WRITE, bootrom.svc_table, bootrom.svc_code + 0x20, diag.onSvcTableWrite, m);
+        // 监视 RAMF0 写入：crt0 装载器把驱动/表段搬进来时，第一现场立刻可见
+        try m.eng.hookMem(&m.hook_ramf0wr, c.UC_HOOK_MEM_WRITE, map.ramf0_base, map.ramf0_base + map.ramf0_size - 1, diag.onRamF0Write, m);
         // 监视 init_dispatch 代码区写入：确认是否有代码被运行时改写
         try m.eng.hookMem(&m.hook_lowram, c.UC_HOOK_MEM_WRITE, 0x7000_82E0, 0x7000_8340, diag.onLowRamWrite, m);
         return m;
@@ -160,6 +227,17 @@ pub const Machine = struct {
         const size = 0x400_0000;
         try self.eng.memMap(base, size, uc.Perm.combine(&.{ .read, .write, .exec }));
         log.info(@src(), "外部 RAM: 0x{x:0>8}..0x{x:0>8} ({d} MB, RWX)", .{ base, base + size, size >> 20 });
+    }
+
+    /// RAMF0（0xF0000000 起 8MB）：MAUI/Nucleus 的 OS 数据区——就绪标志
+    /// 0xF05DDF64/0xF05DDF40、调度器栈 0xF0424000。依据 docs/mt6250-wiring.md
+    /// 内存图（run761 逐个崩溃点验证）。之前没映射时靠 --lenient 逐页兜底，
+    /// 既慢又会把故障表刷满（实测 MAUI 会一路写到 0xF045xxxx）。
+    pub fn mapRamF0(self: *Machine) !void {
+        const base = map.ramf0_base;
+        const size = map.ramf0_size;
+        try self.eng.memMap(base, size, uc.Perm.combine(&.{ .read, .write, .exec }));
+        log.info(@src(), "RAMF0: 0x{x:0>8}..0x{x:0>8} ({d} MB, RWX)", .{ base, base + size, size >> 20 });
     }
 
     /// 外设窗口挂成 MMIO：已接线的寄存器按 docs/mt6250-wiring.md 给行为，
@@ -266,6 +344,11 @@ pub const Machine = struct {
             // 停机时 dump 出来才能离线反汇编（静态镜像里没有这段）
             self.dumpMem(0x7000_4B80);
             self.dumpMem(0x7000_4D00);
+            // 停机 PC 所在页：卡点常常是「运行时拷进 RAM 的代码」，只有现场 dump 才有
+            const pc = self.readPc() catch 0;
+            self.dumpMem(pc & ~@as(u32, 0xFF));
+            // RAMF0 入口页：MAUI 拷进去执行的代码（静态镜像里也没有）
+            if (self.ramf0_entry != 0) self.dumpMem(self.ramf0_entry & ~@as(u32, 0xFF));
         }
         self.dumpExecHist();
         self.reportFaults();
