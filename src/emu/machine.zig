@@ -15,7 +15,9 @@ const periph = @import("periph.zig");
 const diag = @import("diag.zig");
 const bootrom = @import("bootrom.zig");
 
-/// MT6250 地址空间。除 SRAM 外基本都是*推测*，需要靠实测（固件访问地址）校正。
+/// MT6250 地址空间映射。除 SRAM 外基本都是*推测*，需靠实测（固件访问地址）校正。
+/// 完整/权威的地址空间视图 + 各分区详解 + 已知缺口见 docs/memory_map.md
+/// （改任何映射前先回看那里，保持代码与文档一致）。
 pub const map = struct {
     /// boot 阶段的 flash 视图：BL 从这里读到自己的 GFH（实测 0x000008a8）
     pub const boot_view_base = 0x0000_0000;
