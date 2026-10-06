@@ -386,6 +386,15 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
     if (addr == 0xA052_0080 and (value & 1) != 0) {
         dumpFifo(self, 0);
         dumpFifo(self, 32);
+        // 诊断开关 --dma-copy：实现「DMA 把 FIFO 内容搬到 +0x00 目标」这一真实
+        // 硬件行为，用来判别固件那次 CAKE 校验到底是不是 1:1 搬运的结果。
+        // （真机目标必可写，所以配 --flash-rw；正式确定后再决定映射。）
+        if (self.dma_copy) {
+            const dst = leRead(self.xfer_regs2[0..], 0x100, 4);
+            const n: usize = @min(self.xfer_fifo.len, 0x2000);
+            _ = c.uc_mem_write(self.eng.handle, dst, &self.xfer_fifo, n);
+            log.info(@src(), "  [DMA搬运] FIFO 0x{x} 字节 → 目标 0x{x:0>8}", .{ n, dst });
+        }
         // 诊断开关 --cake-patch：用固件自己的期望值补上 magic，验证这是不是
         // 唯一卡点。正式修法是实现真实搬运，到时删掉这个分支。
         if (self.cake_patch) {

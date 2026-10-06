@@ -229,6 +229,8 @@ pub const Machine = struct {
     xfer_regs: [0x100]u8 = @splat(0),
     /// 传输引擎寄存器堆（0xA051FF00 起 0x200 字节，覆盖真实基址 0xA051FFE0）
     xfer_regs2: [0x200]u8 = @splat(0),
+    /// 诊断：DMA 启动时真的把 FIFO 搬到 +0x00 目标（判别是否 1:1 搬运）
+    dma_copy: bool = false,
     /// 诊断：DMA 启动后把传输起始地址处补上固件期望的 "CAKE" magic
     cake_patch: bool = false,
     /// 诊断：把 flash 窗口也映射为可写（真机若 DMA/固件写 XIP 地址，只读映射

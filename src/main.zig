@@ -61,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     // 诊断：flash 窗口也映射为可写（判断 XIP 地址到底会不会被 DMA/固件写）
     mach.flash_rw = hasArg(args, "--flash-rw");
     mach.cake_patch = hasArg(args, "--cake-patch");
+    mach.dma_copy = hasArg(args, "--dma-copy");
     // 周期 tick（每 N 条指令一次中断，0 = 关）：用来启动 OS 调度
     mach.tick_interval = tickArg(args);
     mach.tick_irq = @truncate(tickArg2(args, "--tick-irq=", 11));
