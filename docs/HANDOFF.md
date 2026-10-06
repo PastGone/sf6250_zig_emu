@@ -320,9 +320,15 @@ addr:0x1007BD14 ... Memory dump is disabled! ...
 - RAM 补丁区 0xF0700000+（BootROM 服务）已实现宿主侧拦截
   （`onRamPatchExec`：清 CPSR.I + 返回 0）；veneer 表 101 个目标全部
   bit0=1（Thumb），ARMv5TE Thumb 无法自改 CPSR → 只能模拟器侧做
-- **下一层问题**：MAUI 为何走到关机——ALICE_1 断言（0x1002AE90 ←
-  reset handler）与 OSTD 超时（0x1007064C 自旋→超时→CR 链）两条线；
-  目标 = 让 OS 调度器持续运转（手机保持开机）
+- **下一层问题（2026-10-07 更新，OS 启动已打通）**：
+  `onRamPatchExec`（RAM 补丁区宿主侧钩子）实现「OS 启动」——清 CPSR.I +
+  返回 0。实测时间线：★BL2(2.74M) → ★MAUI → BootROM 补丁调用
+  (0xf072bd7c, r0=1, r1=0x12) → 清 I 位 → [IRQ #1] 中断 11（OSTD）交付至
+  固件 IRQ 入口 0x700096b0 → MAUI 带中断跑 96M 条 → 0x1002e38a 关机自旋
+  （main 正常退出路径，CR 链未走——无第二次补丁调用）
+  **待查**：0x1002e38a 所在函数（关机序列）的调用链——MAUI 为何在
+  96M 条后决定关机（ALICE_1 断言之后某处决策）；以及 OSTD handler
+  （0x70009529，运行时码）内部的 OSTD 寄存器轮询是否满足
 - OSTD 硬件 0xA01F0040 已接线（LISR 11 处理器的寄存器基址）；处理器
   运行时码只在运行时存在（静态乱码），停机 dump 已含 0x70009500
 - 机器拆分已按 REFACTOR.md 完成（machine/periph/diag/bootrom 四文件）
