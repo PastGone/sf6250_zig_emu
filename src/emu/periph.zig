@@ -10,6 +10,7 @@ const c = uc.c;
 const machine = @import("machine.zig");
 const Machine = machine.Machine;
 const bootrom = @import("bootrom.zig");
+const alice = @import("alice.zig");
 
 /// 已接线的寄存器区块（地址→名字）。行为依据见 docs/mt6250-wiring.md。
 pub const known_regions = [_]struct { base: u32, name: []const u8 }{
@@ -105,6 +106,11 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     if (addr >= 0xA005_0000 and addr < 0xA005_1000) {
         return leRead(self.clk_regs[0..], addr - 0xA005_0000, size);
     }
+    // EMI 初始化完成状态（0xA0180040）：MAUI sub_10070886 轮询 `(*(u32*)0xA0180040)
+    // & 0xF == 1`（低 4 位 == 1 = DRAM 训练/EMI 初始化完成）。真机由 EMI 控制器在
+    // 训练完成后置位；模拟器不做 DRAM 训练，直接给「完成」值放行，否则固件在此
+    // 5 百万次忙等（实测）。
+    if (addr == 0xA018_0040) return 0x1;
     // EMI/总线命令（0xA0180080 起，整块接成寄存器文件）。
     // 依据见 HANDOFF §9.8 / wiring 文档：BL sub_70008F94 用它发命令、等 bit31，
     // 并读 +0xA8/+0xAC 做时序校准（伪代码要求差值落在 [51,73]，dword_70009000
@@ -126,6 +132,21 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
         if (off == 0xAC) return 0x3C; // 结束计数（60，落在 [51,73] 内）
         return leRead(self.emi_regs[0..], off, size);
     }
+    // EMI 配置 bank（0xA0180800 起，DRAM 时序寄存器）。BL/MAUI 写时序值后
+    // 读回；MAUI sub_1005D0F4 先把 +0x808 |= 0x144，再轮询 +0x820 的 bit2
+    // = 配置生效/命令完成（未置位则死循环，实测 1900 万次）。给该位置位放行。
+    if (addr >= 0xA018_0800 and addr < 0xA018_0C00) {
+        const off = addr - 0xA018_0000;
+        var v = leRead(self.emi_regs[0..], off, size);
+        if (off == 0x820) v |= 0x4;
+        return v;
+    }
+    // EMI +0x0104：自由运行时基。MAUI sub_100706A4（XIP 0x100706A4）就两句
+    // `ldr r0,=0xA0180100; ldr r0,[r0,#4]; bx lr` —— 直接返回 *(u32*)0xA0180104；
+    // 调用方（如 0x10021212 存进 OS 时间变量 0xF03D004C+0x10）把它当单调计数器。
+    // 未接线时恒读 0 → 时间永不前进，调度等待循环在 0x1007BCE6 空转（实测该地址
+    // 被读 1748 万次）。按指令数推进（右移 4 ≈ 每 16 条指令 +1），给出递增时基。
+    if (addr == 0xA018_0104) return @truncate(self.instrs >> 4);
     // 中断全局控制（0xA0030000/08）：回读保留（MAUI sub_10037A84 读改写）
     if (addr == 0xA003_0000) return self.intc_ctrl;
     if (addr == 0xA003_0008) return self.intc_ctrl8;
@@ -148,7 +169,43 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     }
     // GPT 通用定时器（0xA00C0000）：寄存器文件。STA(+0x10) 回 0 = 无超时事件
     if (addr >= 0xA00C_0000 and addr < 0xA00C_0040) {
-        return leRead(self.gpt_regs[0..], addr - 0xA00C_0000, size);
+        const off = addr - 0xA00C_0000;
+        var v = leRead(self.gpt_regs[0..], off, size);
+        // +0x10 = STA 事件位：MAUI 0x1006B844 的等待循环读它并测 bit1
+        // （`ldrh r1,[r3,#0x10]; ands r1,#2; orrs r1,r2; beq loop`）——未置位就
+        // 原地空转（实测 200M 预算末尾卡在此 4 条指令的环里）。模拟器不做定时，
+        // 直接把定时器 1 的事件位置位放行（固件写 +0x10 清位仍可生效）。
+        if (off == 0x10 and size == 2) v |= 0x2;
+        return v;
+    }
+    // OSTD 系统定时器（0xA01F0000）：寄存器文件 + +0x08 bit1=就绪。
+    // MAUI sub_10022710：读 +0x0C 断言 >= 1000（固件 sub_100227FC 已写入 0x1207），
+    // 再写 CON(+0x00) 后轮询 +0x08 的 bit1（未置位则 600 次后 panic 450）。
+    // 未接线时两者读 0 → 断言失败，随后滑进 0xF072BD7C 崩溃处理链（实测）。
+    if (addr >= 0xA01F_0000 and addr < 0xA01F_0100) {
+        const off = addr - 0xA01F_0000;
+        var v = leRead(self.ostd_regs[0..], off, size);
+        if (off == 0x08 and size == 2) v |= 0x2; // bit1 = 定时器就绪
+        return v;
+    }
+    // LCM/LCD 控制器（0xA0450000）：面板 ID 应答 + 寄存器文件（见 machine 字段注释）。
+    // +0xF00 写命令 0xD3(Read ID4) 后，+0xF10 逐字节返回 [00 00 93 41]；+0x00 bit0=忙=0。
+    if (addr >= 0xA045_0000 and addr < 0xA045_2000) {
+        const off = addr - 0xA045_0000;
+        if (off == 0xF10) { // 数据口：从响应队列逐字节弹出（空则回 0）
+            var v: u64 = 0;
+            var i: u32 = 0;
+            while (i < size) : (i += 1) {
+                const b: u8 = if (self.lcm_fifo_pos < self.lcm_fifo_len) blk: {
+                    const x = self.lcm_fifo[self.lcm_fifo_pos];
+                    self.lcm_fifo_pos += 1;
+                    break :blk x;
+                } else 0;
+                v |= @as(u64, b) << @intCast(8 * i);
+            }
+            return v;
+        }
+        return leRead(self.lcm_regs[0..], off, size);
     }
     // HIF0/HIF1 主机接口（0xA0190000 / 0xA01A0000，数据手册 4.16 章）：
     // 寄存器文件 + 数据窗口；STA(+0x00) 的 bit0=BUSY 恒 0（空闲）
@@ -195,19 +252,49 @@ fn periphRead(self: *Machine, addr: u32, size: u32) u64 {
     if (addr >= 0xA070_0000 and addr < 0xA070_1000) return leRead(self.a070_regs[0..], addr - 0xA070_0000, size);
     if (addr >= 0xA01C_0000 and addr < 0xA01C_0200) return leRead(self.a01c_regs[0..], addr - 0xA01C_0000, size);
     if (addr >= 0xA003_0000 and addr < 0xA003_0100) return leRead(self.a003_regs[0..], addr - 0xA003_0000, size);
-    if (addr >= 0xA001_0000 and addr < 0xA001_0400) return leRead(self.a001_regs[0..], addr - 0xA001_0000, size);
+    // A001 寄存器文件。+0x228 是「启动模式/正常启动」标志位域：BL2 侧有一个
+    // setter（XIP 0x100088B4：`ldr r0,=0xA0010220; ldrh r1,[r0,#8]; orrs r1,#1;
+    // strh r1,[r0,#8]`）和三个 getter（0x10008D54 取 bit2、0x10008D68 取 bit0、
+    // 0x10008D78 取 bit3）。MAUI 侧 crt0 链（0x100211F8）读 bit0 存进 *(u16*)0xF03D004E，
+    // 而 sub_10092E04 原样返回它、0x10021C74 处「== 1 才写 magic 0x26409001」；
+    // 位为 0 则 0x100308CC 的关机检查失败 → 走关机（run12 实测）。
+    // 真机由 BootROM/BL 在启动链里置位；本模拟器的 BootROM 模型不覆盖该 strap，
+    // 故按「正常 flash 启动」给出 bit0 = 1（写入仍可回读，setter 语义不受影响）。
+    if (addr >= 0xA001_0000 and addr < 0xA001_0400) {
+        const off = addr - 0xA001_0000;
+        var v = leRead(self.a001_regs[0..], off, size);
+        if (off == 0x228 and size == 2) v |= 0x1;
+        return v;
+    }
     if (addr >= 0xA073_0000 and addr < 0xA073_1000) return leRead(self.acfg_regs[0..], addr - 0xA073_0000, size);
     // PWM（0xA00E0000）/ MSDC（0xA0130000）/ ACCDET（0xA0750000）：寄存器文件，
     // 见 §字段注释（数据手册均有章节；无卡/无配件时读 0 是合理默认）。
     if (addr >= 0xA00E_0000 and addr < 0xA00E_1000) return leRead(self.pwm_regs[0..], addr - 0xA00E_0000, size);
     if (addr >= 0xA013_0000 and addr < 0xA013_1000) return leRead(self.msdc_regs[0..], addr - 0xA013_0000, size);
     if (addr >= 0xA075_0000 and addr < 0xA075_0100) return leRead(self.accdet_regs[0..], addr - 0xA075_0000, size);
+    // 2 号传输/DMA 引擎（0xA0230000）：寄存器文件 + 读 +0x0C 恒为「已完成」。
+    // 轮询点 0x1008E904（sub_1008E900 读 +0x0C）；未接线时该地址被读 630 万次
+    // 而 sub_100276C4 在其中死循环（见 dma2_regs 字段注释）。
+    if (addr >= 0xA023_0000 and addr < 0xA023_0100) {
+        const off = addr - 0xA023_0000;
+        var v = leRead(self.dma2_regs[0..], off, size);
+        if (off == 0x0C) v |= 0x1; // bit0 = 传输完成
+        return v;
+    }
     // 传输/DMA 引擎（0xA0520000）：见 xfer_regs 字段注释
     if (addr >= 0xA052_0000 and addr < 0xA052_0100) {
         var v = leRead(self.xfer_regs[0..], addr - 0xA052_0000, size);
         // +0x34 的 bit31 = 传输完成（固件写启动位后等它置位）
         if (addr - 0xA052_0000 == 0x34) v |= 0x8000_0000;
         return v;
+    }
+    // 传输/DMA 引擎数据窗口（0xA0521000 起 0x2000）：固件先把源数据 memcpy 进来，
+    // 再用 memcmp（本体 XIP 0x1009101A；调用点 0x10040D52 / 0x10040D78）校验窗口内容。
+    // 写入侧早已接进 xfer_fifo，**读取侧此前漏接** → memcmp 读到全 0 判不等，
+    // 0x10040D5A 处把状态字节置上错误位 → 触发「Fatal Error (0xa02, 0x1)」并走
+    // TST 内存转储（run14 实测）。补上读取即可让固件看到自己写进去的数据。
+    if (addr >= 0xA052_1000 and addr < 0xA052_3000) {
+        return leRead(self.xfer_fifo[0..], addr - 0xA052_1000, size);
     }
 
     if (uartIndex(addr) != null) {
@@ -420,6 +507,11 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         leWrite(self.emi_regs[0..], off, size, value);
         return;
     }
+    // EMI 配置 bank（0xA0180800 起，DRAM 时序寄存器）：寄存器文件，写入可读回
+    if (addr >= 0xA018_0800 and addr < 0xA018_0C00) {
+        leWrite(self.emi_regs[0..], addr - 0xA018_0000, size, value);
+        return;
+    }
     // AUXADC / GPT / HIF / NLI_ARB 写侧：一律寄存器文件（写入值可读回），
     // 固件做的配置才不会丢。AUXADC 的 DAT* 是只读采样值，读侧会覆盖掉。
     if (addr >= 0xA015_0000 and addr < 0xA015_0100) {
@@ -428,6 +520,31 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
     }
     if (addr >= 0xA00C_0000 and addr < 0xA00C_0040) {
         leWrite(self.gpt_regs[0..], addr - 0xA00C_0000, size, value);
+        return;
+    }
+    // OSTD 系统定时器（0xA01F0000）：寄存器文件，写入值可读回（+0x0C=0x1207 等）
+    if (addr >= 0xA01F_0000 and addr < 0xA01F_0100) {
+        leWrite(self.ostd_regs[0..], addr - 0xA01F_0000, size, value);
+        return;
+    }
+    // LCM/LCD 控制器（0xA0450000）：写 +0xF00 命令后装填 +0xF10 响应队列，其余寄存器文件
+    if (addr >= 0xA045_0000 and addr < 0xA045_2000) {
+        const off = addr - 0xA045_0000;
+        if (off == 0xF00) {
+            self.lcm_fifo_pos = 0;
+            self.lcm_fifo_len = 0;
+            switch (@as(u8, @truncate(value))) {
+                0xD3 => { // ILI9341 Read ID4：dummy,dummy,0x93,0x41 → (b2<<8)|b3 = 0x9341
+                    self.lcm_fifo[0] = 0x00;
+                    self.lcm_fifo[1] = 0x00;
+                    self.lcm_fifo[2] = 0x93;
+                    self.lcm_fifo[3] = 0x41;
+                    self.lcm_fifo_len = 4;
+                },
+                else => {},
+            }
+        }
+        leWrite(self.lcm_regs[0..], off, size, value);
         return;
     }
     if (addr >= 0xA019_0000 and addr < 0xA019_0400) {
@@ -523,22 +640,69 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         }
         self.xfer2_writes += 1;
         leWrite(self.xfer2_regs[0..], off, size, value);
+        // +0x04 = 19：硬件 ALICE 解码引擎「触发」。固件（MAUI sub_100324B8）先配好
+        // 0xA0520000 的 ALICE 区间寄存器与 DMA 目标，随后调用 sub_1003A448 写 19，
+        // 紧接着校验 *(0x10947980) == "CAKE"。真机由该硬件把 flash 0x108E65A8 处的
+        // ALICE_1 blob 解压到目标；这里用同一套算法（src/emu/alice.zig）在宿主侧
+        // 等价实现，写入 DMA 目标寄存器（0xA0520000 +0x00）。
+        if (off == 4 and @as(u32, @truncate(value)) == 19) aliceDecodeToTarget(self);
         return;
     }
     // 以下寄存器文件块（读侧已加）：ACFG GPIO / A002 GPIO-CLK / A017 / A051 / A054 /
     // A070。统一「写入值可读回」，固件配置不丢；不伪造任何硬件行为。
-    if (addr >= 0xA002_0000 and addr < 0xA002_1000) { leWrite(self.a002_regs[0..], addr - 0xA002_0000, size, value); return; }
-    if (addr >= 0xA017_0000 and addr < 0xA017_1000) { leWrite(self.a017_regs[0..], addr - 0xA017_0000, size, value); return; }
-    if (addr >= 0xA051_0000 and addr < 0xA051_1000) { leWrite(self.a051_regs[0..], addr - 0xA051_0000, size, value); return; }
-    if (addr >= 0xA054_0000 and addr < 0xA054_1000) { leWrite(self.a054_regs[0..], addr - 0xA054_0000, size, value); return; }
-    if (addr >= 0xA070_0000 and addr < 0xA070_1000) { leWrite(self.a070_regs[0..], addr - 0xA070_0000, size, value); return; }
-    if (addr >= 0xA01C_0000 and addr < 0xA01C_0200) { leWrite(self.a01c_regs[0..], addr - 0xA01C_0000, size, value); return; }
-    if (addr >= 0xA003_0000 and addr < 0xA003_0100) { leWrite(self.a003_regs[0..], addr - 0xA003_0000, size, value); return; }
-    if (addr >= 0xA001_0000 and addr < 0xA001_0400) { leWrite(self.a001_regs[0..], addr - 0xA001_0000, size, value); return; }
-    if (addr >= 0xA073_0000 and addr < 0xA073_1000) { leWrite(self.acfg_regs[0..], addr - 0xA073_0000, size, value); return; }
-    if (addr >= 0xA00E_0000 and addr < 0xA00E_1000) { leWrite(self.pwm_regs[0..], addr - 0xA00E_0000, size, value); return; }
-    if (addr >= 0xA013_0000 and addr < 0xA013_1000) { leWrite(self.msdc_regs[0..], addr - 0xA013_0000, size, value); return; }
-    if (addr >= 0xA075_0000 and addr < 0xA075_0100) { leWrite(self.accdet_regs[0..], addr - 0xA075_0000, size, value); return; }
+    if (addr >= 0xA002_0000 and addr < 0xA002_1000) {
+        leWrite(self.a002_regs[0..], addr - 0xA002_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA017_0000 and addr < 0xA017_1000) {
+        leWrite(self.a017_regs[0..], addr - 0xA017_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA051_0000 and addr < 0xA051_1000) {
+        leWrite(self.a051_regs[0..], addr - 0xA051_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA054_0000 and addr < 0xA054_1000) {
+        leWrite(self.a054_regs[0..], addr - 0xA054_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA070_0000 and addr < 0xA070_1000) {
+        leWrite(self.a070_regs[0..], addr - 0xA070_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA01C_0000 and addr < 0xA01C_0200) {
+        leWrite(self.a01c_regs[0..], addr - 0xA01C_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA003_0000 and addr < 0xA003_0100) {
+        leWrite(self.a003_regs[0..], addr - 0xA003_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA001_0000 and addr < 0xA001_0400) {
+        leWrite(self.a001_regs[0..], addr - 0xA001_0000, size, value);
+        return;
+    }
+    // 2 号传输/DMA 引擎（0xA0230000）：寄存器文件，写入可回读（见字段注释）
+    if (addr >= 0xA023_0000 and addr < 0xA023_0100) {
+        leWrite(self.dma2_regs[0..], addr - 0xA023_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA073_0000 and addr < 0xA073_1000) {
+        leWrite(self.acfg_regs[0..], addr - 0xA073_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA00E_0000 and addr < 0xA00E_1000) {
+        leWrite(self.pwm_regs[0..], addr - 0xA00E_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA013_0000 and addr < 0xA013_1000) {
+        leWrite(self.msdc_regs[0..], addr - 0xA013_0000, size, value);
+        return;
+    }
+    if (addr >= 0xA075_0000 and addr < 0xA075_0100) {
+        leWrite(self.accdet_regs[0..], addr - 0xA075_0000, size, value);
+        return;
+    }
     // 传输/DMA 引擎（0xA0520000）：寄存器文件；+0x34 的 bit31 在读取时置位。
     // 注意实际基址是 0xA051FFE0（固件把 r4 先 +0x20 再用），所以范围向下扩。
     if (addr >= 0xA051_FF00 and addr < 0xA052_0100) {
@@ -581,6 +745,38 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
 pub fn onMmioRead(_: ?*c.uc_engine, offset: u64, size: c_uint, user: ?*anyopaque) callconv(.c) u64 {
     const ctx: *RegionCtx = @ptrCast(@alignCast(user.?));
     return periphRead(ctx.machine, @truncate(ctx.base + offset), size);
+}
+
+/// 0xA0530000 硬件 ALICE 解码引擎的等价实现：把 flash 里唯一的 ALICE_1 blob
+/// （0x108E65A8，即 MAUI sub_100324B8 逐字节校验 'A''L''I''C''E''_''1' 的位置）
+/// 解压进 DMA 目标（0xA0520000 +0x00，固件配为 0x10947980）。
+///
+/// 依据（HANDOFF §9.8 + 实测）：目标范围 0x10947980..0x10F39680 = 0x5F1D00 字节，
+/// 与离线解压输出长度 0x5F1CFE 吻合（差 2 字节为块对齐填充）；固件紧随其后
+/// 校验 *(0x10947980) == "CAKE"，而解压输出正好以 "CAKE" 开头。
+fn aliceDecodeToTarget(self: *Machine) void {
+    const img = self.img orelse return;
+    const blob_va: u32 = 0x108E_65A8;
+    const off = blob_va - machine.map.flash_window_base;
+    if (off >= img.data.len) {
+        log.err(@src(), "ALICE blob 0x{x:0>8} 超出镜像范围", .{blob_va});
+        return;
+    }
+    const decoded = alice.decompress(self.allocator, img.data[off..]) catch |e| {
+        log.err(@src(), "ALICE 解压失败 ({s})", .{@errorName(e)});
+        return;
+    };
+    defer self.allocator.free(decoded);
+    const dst = leRead(self.xfer_regs2[0..], 0x100, 4);
+    if (c.uc_mem_write(self.eng.handle, dst, decoded.ptr, decoded.len) != c.UC_ERR_OK) {
+        log.err(@src(), "ALICE 写目标 0x{x:0>8} 失败 (len=0x{x})", .{ dst, decoded.len });
+        return;
+    }
+    var magic: [4]u8 = undefined;
+    const ok = c.uc_mem_read(self.eng.handle, dst, &magic, 4) == c.UC_ERR_OK;
+    log.info(@src(), "  [ALICE] 引擎触发 → 解压 {d} 字节 → 目标 0x{x:0>8} magic={s}", .{
+        decoded.len, dst, if (ok) magic[0..4] else "????",
+    });
 }
 
 /// dump 传输引擎 FIFO（0xA0521000）的 32 字节——启动 DMA 时的源数据

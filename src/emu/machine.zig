@@ -59,6 +59,7 @@ pub const landmarks = [_]u32{
 pub const Machine = struct {
     allocator: std.mem.Allocator,
     eng: uc.Engine,
+    io: std.Io,
     img: ?*const mtk.BootImage = null,
 
     instrs: u64 = 0,
@@ -90,6 +91,10 @@ pub const Machine = struct {
     landmark_hit: [landmarks.len]bool = @splat(false),
     bp_logged: bool = false,
     bp_bss: bool = false,
+    /// 0x70008b36 轮询环机器码抓取标记（一次性）
+    loop_dumped: bool = false,
+    /// 0x70008266 调用点（外层循环驱动）抓取标记（一次性）
+    loopfn_dumped: bool = false,
     bp_brlyt: bool = false,
     shutdown_bp: bool = false,
     bss_calls: u32 = 0,
@@ -182,12 +187,30 @@ pub const Machine = struct {
     fw_log_n: u32 = 0,
     /// CR 上报路径的轨迹是否已 dump（诊断）
     cr_trace_dumped: bool = false,
+    /// 致命错误入口（0x10092FB0）命中次数（诊断）
+    fatal_hits: u32 = 0,
+    /// 致命错误第一现场是否已 dump（诊断）
+    fatal_dumped: bool = false,
+    /// 断言触发者（sub_1008C218）捕获计数（诊断）
+    crash_caller_n: u32 = 0,
+    /// 硬件忙等循环（0x10067CF4）捕获计数（诊断）
+    busywait_n: u32 = 0,
     /// 装载原语调用计数（诊断）
     loader_calls: u32 = 0,
     /// CPSR.I 采样跟踪（诊断：固件到底有没有开 CPU 中断）
     i_bit_last: bool = true,
     /// 采样上限（避免刷屏）
     i_bit_samples: u32 = 0,
+    /// T-bit（Thumb 模式位）变化跟踪：诊断 0x100221f0 的 Invalid instruction——
+    /// 运行时 T=0 但代码是 Thumb，说明某条指令把 T 位从 1 清成了 0。
+    last_t_bit: bool = true,
+    t_bit_samples: u32 = 0,
+    /// 最近一次「切到 ARM（T 1→0）」且**尚未被 0→1 恢复**的现场。flash 区里
+    /// 合法的 Thumb/ARM interworking 会频繁切换 T，所以只记住最后一条没恢复的——
+    /// 若停机时 T 仍为 0 且此字段非 0，它就是把 T 错误清 0 的元凶（停机时 dump）。
+    t_arm_switch_pc: u32 = 0,
+    t_arm_switch_lr: u32 = 0,
+    t_arm_switch_instrs: u64 = 0,
     /// IRQ 现场：进入中断时保存，异常返回后恢复
     irq_active: bool = false,
     irq_ret: u32 = 0,
@@ -237,6 +260,20 @@ pub const Machine = struct {
     /// GPT 通用定时器（0xA00C0000）：GPT1~3 走 32k 时钟、GPT4 走 26M
     /// CON 的 bit15=EN / bit14=MODE(0 单次 / 1 自动重装载)
     gpt_regs: [0x40]u8 = @splat(0),
+    /// OSTD 系统定时器（0xA01F0000）：寄存器文件。实测 MAUI sub_100227FC 先把
+    /// 分频+计数值写进 +0x10/+0x0C（+0x0C = 0x1207），紧接着 sub_10022710 读
+    /// +0x0C 并断言 >= 1000（否则 zLock/pragma 报 line 417）；它随后写 CON(+0x00)
+    /// 并轮询 +0x08 的 bit1=就绪。未接线时读恒 0 → 断言失败并滑进崩溃处理链。
+    ostd_regs: [0x100]u8 = @splat(0),
+    /// LCM/LCD 控制器（0xA0450000）：面板为 ILI9341（ID 0x9341）。实测 MAUI
+    /// sub_1009BD24 先写 +0xF00 = 0xD3（Read ID4），再从 +0xF10 逐字节读回
+    /// 4 字节 [00 00 93 41]，取 (b2<<8)|b3 == 0x9341 判定面板存在并返回 1。
+    /// +0x00 bit0 = 忙（0=就绪，是轮询点）；+0x30/+0x3C/+0x80 等为配置寄存器。
+    lcm_regs: [0x2000]u8 = @splat(0),
+    /// +0xF10 数据口的响应队列：写 +0xF00 命令后按其装填，读 +0xF10 时逐字节弹出
+    lcm_fifo: [16]u8 = @splat(0),
+    lcm_fifo_pos: usize = 0,
+    lcm_fifo_len: usize = 0,
     /// HIF0 / HIF1 主机接口（0xA0190000 / 0xA01A0000）：数据手册 4.16 章
     hif_regs: [0x400]u8 = @splat(0),
     hif1_regs: [0x400]u8 = @splat(0),
@@ -281,7 +318,9 @@ pub const Machine = struct {
     msdc_regs: [0x1000]u8 = @splat(0),
     /// EMI/总线命令（0xA0180080 起）：BL 服务(0x70008F94) 用它发命令、等 bit31、
     /// 并做时序校准（读 +0xA8/+0xAC）。整块接成寄存器文件，特殊位返回合理值。
-    emi_regs: [0x100]u8 = @splat(0),
+    /// 另含 EMI 配置 bank（0xA0180800 起，DRAM 时序）——MAUI 写完后轮询 +0x820
+    /// 的 bit2 = 配置生效，故缓冲扩到 0x1000 覆盖 +0x820..+0xA40。
+    emi_regs: [0x1000]u8 = @splat(0),
     /// CLK/PLL 配置（0xA0050000 起）：除 0x090(时钟切换命令)/0x318(PLL 锁定) 两
     /// 个特判点外，整块接成寄存器文件（时钟配置写入可回读，不伪造锁定状态）。
     clk_regs: [0x1000]u8 = @splat(0),
@@ -291,6 +330,12 @@ pub const Machine = struct {
     /// 新段 A001（文档未覆盖）：均黑盒寄存器文件。
     a003_regs: [0x100]u8 = @splat(0),
     a001_regs: [0x400]u8 = @splat(0),
+    /// 2 号传输/DMA 引擎（0xA0230000）：MAUI sub_100B04AC 把描述符的
+    /// src(+0x00)/+0x04/len(+0x10)/+0x14 写进 0xA0230000 起 4 个寄存器，
+    /// 再置 +0x08 的 bit30/bit31（bit31 = 启动），随后 sub_1008E900 轮询
+    /// +0x0C 的完成位；sub_100276C4 在 `+0x0C==0 且 0xF0423D9A==0` 时死循环
+    /// （实测 +0x0C 被读 630 万次）。模型：寄存器文件 + 读 +0x0C 恒为「已完成」。
+    dma2_regs: [0x100]u8 = @splat(0),
     /// 传输引擎数据窗口（0xA0521000 起）内容：固件 memcpy 源数据进来，再启动
     /// DMA 搬走。保存它才能看清「搬的到底是什么」
     xfer_fifo: [0x2000]u8 = @splat(0),
@@ -318,14 +363,14 @@ pub const Machine = struct {
     fault_kinds: [max_faults][:0]const u8 = undefined,
     fault_counts: [max_faults]u64 = @splat(0),
 
-    pub fn init(allocator: std.mem.Allocator) !*Machine {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !*Machine {
         // ARM7EJ-S 是 ARMv5TEJ，Unicorn 没有该型号，用同为 ARMv5TEJ 的 ARM926 近似。
         // MTK 的 BL 是 Thumb 代码，因此以 THUMB 模式起跑（不对再切回 ARM 模式）。
         const eng = try uc.Engine.open(c.UC_ARCH_ARM, c.UC_MODE_ARM926 | c.UC_MODE_THUMB);
         errdefer eng.close();
 
         const m = try allocator.create(Machine);
-        m.* = .{ .allocator = allocator, .eng = eng };
+        m.* = .{ .allocator = allocator, .eng = eng, .io = io };
 
         try m.eng.hookCode(&m.hook_code, diag.onCode, m);
         try m.eng.hookMemInvalid(&m.hook_mem, diag.onMemInvalid, m);
@@ -372,6 +417,13 @@ pub const Machine = struct {
         const base = 0x8200_0000;
         const size = 0x400_0000;
         try self.eng.memMap(base, size, uc.Perm.combine(&.{ .read, .write, .exec }));
+        // EMI 的「DRAM 窗口别名视图」：MT6250 在 DRAM 窗口内 0x83010000 处镜像了
+        // EMI/DRAM 控制器（偏移与 0xA0180000 一致：+0x40/+0x80/+0x200/+0x800/
+        // +0x900/+0xa00）。MAUI sub_1002302E 轮询 `(*(u32*)0x83010040) & 0xF == 1`
+        // = DRAM 训练/初始化完成；sub_10023000 的初始化序列也在这里写训练参数。
+        // 该窗口落在外部 RAM 内（写可回读），但「完成」是硬件置位的状态、固件从不
+        // 写它，故把 +0x40 预置为 1 放行，否则固件在此永久自旋（实测）。
+        try self.eng.memWrite(0x8301_0040, &[_]u8{ 1, 0, 0, 0 });
         log.info(@src(), "外部 RAM: 0x{x:0>8}..0x{x:0>8} ({d} MB, RWX)", .{ base, base + size, size >> 20 });
     }
 
@@ -403,15 +455,50 @@ pub const Machine = struct {
     /// 把整份 flash 以 XIP 方式挂在 0x1000_0000（零拷贝，只读可执行）。
     /// 依据：MAUI 的 file offset 0x20000 ↔ load_addr 0x10020000，第二段
     /// 0x8752b0 ↔ 0x108752b0，即 flash 被线性映射到 0x1000_0000 起。
+    /// 注意：装载/解压目标区 `0x1094_7980~0x10F3_9680` 在真机是 **RAM**（不是 NOR，
+    /// HANDOFF §9.8 用 `--dma-copy` 实测确证：DMA 能写进去 ⇒ 是 RAM），但它落在
+    /// flash XIP 窗口内，必须单独 map 成 RAM，否则 DMA 装载写不进去、固件跳进这里
+    /// 取指会崩。页对齐切分：段1(flash) / 段2(装载区 RAM) / 段3(flash 高部资源)。
     pub fn mapFlashWindow(self: *Machine, img: *const mtk.BootImage) !void {
         const perms = if (self.flash_rw)
             uc.Perm.combine(&.{ .read, .write, .exec })
         else
             uc.Perm.combine(&.{ .read, .exec });
 
-        try self.eng.memMapPtr(map.flash_window_base, img.data.len, perms, @constCast(img.data.ptr));
-        log.info(@src(), "flash 窗口: 0x{x:0>8}..0x{x:0>8} ({d} 字节, 只读可执行)", .{
-            map.flash_window_base, map.flash_window_base + img.data.len, img.data.len,
+        const base = map.flash_window_base; // 0x1000_0000
+        const end = base + img.data.len; // 0x1100_0000 (16MB)
+        const ptr = @constCast(img.data.ptr);
+
+        // 装载区（必须是 RAM，页对齐）：0x1094_7000 .. 0x10F3_A000 覆盖真实范围
+        const load_lo = 0x1094_7000;
+        const load_hi = 0x10F3_A000;
+        const load_perms = uc.Perm.combine(&.{ .read, .write, .exec });
+
+        // 段1: 0x1000_0000 .. load_lo  flash XIP（MAUI 代码/数据在此，不重叠装载区）
+        try self.eng.memMapPtr(base, load_lo - base, perms, ptr);
+        // 段2: load_lo .. load_hi  装载/RAM（固件把解压代码写这里、随后取指执行）
+        try self.eng.memMap(load_lo, load_hi - load_lo, load_perms);
+        // 段3: load_hi .. end  flash XIP（镜像高部资源，若有剩余）
+        if (load_hi < end) {
+            try self.eng.memMapPtr(load_hi, end - load_hi, perms, ptr + (load_hi - base));
+        }
+        log.info(@src(), "flash 窗口: 0x{x:0>8}..0x{x:0>8} ({d} 字节, 只读可执行)；装载区 0x{x:0>8}..0x{x:0>8} 改 RAM", .{
+            base, end, img.data.len, load_lo, load_hi,
+        });
+
+        // 非缓存别名视图：MAUI 用 0x9000_0000（= 0x1000_0000 | 0x8000_0000）读写 flash。
+        // 实测（run12/run13 未接线时读 unmapped）：0x90E50000..0x90FF0000 步长 0x10000
+        // （= flash 偏移 0x0E50000 起的 NVRAM/FS 区）与 0x908E65A8（= CAKE blob
+        // 0x108E65A8 的别名）都从这个别名读；此前压根没映射该窗口 → 读到 0 → 数据全错。
+        // 布局与 0x1000_0000 视图一致（段 2 装载区仍是 RAM，单独分配）。
+        const alias = 0x9000_0000;
+        try self.eng.memMapPtr(alias, load_lo - base, perms, ptr);
+        try self.eng.memMap(alias + (load_lo - base), load_hi - load_lo, load_perms);
+        if (load_hi < end) {
+            try self.eng.memMapPtr(alias + (load_hi - base), end - load_hi, perms, ptr + (load_hi - base));
+        }
+        log.info(@src(), "非缓存别名: 0x{x:0>8}..0x{x:0>8}（映射到同一 flash 镜像）", .{
+            alias, alias + img.data.len,
         });
 
         // BL 会去读 0x000008a8（= flash 偏移 0x8a8，正是它自己的 GFH），
@@ -479,6 +566,36 @@ pub const Machine = struct {
             log.info(@src(), "停止现场: cpsr=0x{x:0>8} (T={d}, mode=0x{x}) sp=0x{x:0>8}", .{
                 cpsr, (cpsr >> 5) & 1, cpsr & 0x1F, sp,
             });
+            // 嫌疑 T 1→0 现场：若停机时 T 仍为 0 且存在一条「切到 ARM 却没切回」的
+            // 切换，它就是把 T 错误清 0 的元凶。dump 其 pc 前后（含切走 T 的 branch
+            // 指令，通常在 pc 之前）与返回点 lr，离线反编译即可定位。
+            if (self.t_arm_switch_pc != 0 and (cpsr & 0x20) == 0) {
+                log.warn(@src(), "嫌疑 T 1→0 未恢复: pc=0x{x:0>8} lr=0x{x:0>8} instrs={d}（停机 T={d}）", .{
+                    self.t_arm_switch_pc, self.t_arm_switch_lr, self.t_arm_switch_instrs, (cpsr >> 5) & 1,
+                });
+                const lo = self.t_arm_switch_pc -% 8;
+                var buf: [0x80]u8 = undefined;
+                if (c.uc_mem_read(self.eng.handle, lo, &buf, buf.len) == c.UC_ERR_OK) {
+                    var hx: [3 * 0x80]u8 = undefined;
+                    var n: usize = 0;
+                    for (buf) |b| {
+                        const p = std.fmt.bufPrint(hx[n..], "{x:0>2}", .{b}) catch break;
+                        n += p.len;
+                    }
+                    log.warn(@src(), "  Tbit bytes@(pc-8)=0x{x:0>8}: {s}", .{ lo, hx[0..n] });
+                }
+                const lrl = self.t_arm_switch_lr & ~@as(u32, 1);
+                var lrb: [0x40]u8 = undefined;
+                if (c.uc_mem_read(self.eng.handle, lrl, &lrb, lrb.len) == c.UC_ERR_OK) {
+                    var hx: [3 * 0x40]u8 = undefined;
+                    var n: usize = 0;
+                    for (lrb) |b| {
+                        const p = std.fmt.bufPrint(hx[n..], "{x:0>2}", .{b}) catch break;
+                        n += p.len;
+                    }
+                    log.warn(@src(), "  Tbit bytes@lr=0x{x:0>8}: {s}", .{ lrl, hx[0..n] });
+                }
+            }
             var mem: [0x80]u8 = undefined;
             if (c.uc_mem_read(self.eng.handle, 0x7000_82C0, &mem, mem.len) == c.UC_ERR_OK) {
                 var hx: [3 * 0x80]u8 = undefined;

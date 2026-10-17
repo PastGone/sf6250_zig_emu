@@ -7,6 +7,8 @@
 pub const unicorn = @import("unicorn.zig");
 pub const machine = @import("machine.zig");
 pub const display = @import("display.zig");
+/// ALICE 软件解码器（区间编码 + 位打包的 Thumb 指令流解压）
+pub const alice = @import("alice.zig");
 
 pub const Machine = machine.Machine;
 pub const Display = display.Display;
