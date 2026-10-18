@@ -1,11 +1,12 @@
-//! ALICE 软件解码器（Zig 移植自 donnm/mtk_fw_tools 的 unalice.py）。
+//! ALICE 解码算法内核（Zig 移植自 donnm/mtk_fw_tools 的 unalice.py）。
 //!
 //! MTK 功能机固件的主体代码（ALICE_1 / ALICE_2 分区）并非原始存放，而是经过
 //! **区间编码（range encoding）+ 位打包（bitpacked）** 压缩的 Thumb 指令流。
-//! 真机在 Bootloader/MAUI 阶段用**固件自身的软件解码器**（Thumb 代码）把它
-//! 解压进 RAM 再执行——也就是说「解码」这件事是固件自己做的，不是某个硬件
-//! 解码器。本模块把同一套解码算法用 Zig 重写，作为模拟器侧的等价软件解码：
-//! 既可以用来独立解压固件做逆向/校验，也可以在模拟器里按需解码 ALICE 分区。
+//! 真机上固件把它当**硬件解压引擎**调用（BL 0x10008994 / MAUI sub_100324B8：
+//! 配寄存器 → 喂字典 → 写触发寄存器 → 轮询结果），CPU 全程不执行解压循环。
+//! 本模块是该引擎的算法内核（移植自 unalice.py 对该格式的逆向），既可独立
+//! 解压固件做逆向/校验，也作为模拟器里引擎模型的解码实现（见 periph.zig
+//! 的 aliceDecodeToTarget：源/目标/参数全部来自固件写入的引擎寄存器）。
 //!
 //! 与 unalice.py 的差异：
 //!   - 只实现「原始解压」（untranslate_bl_blx 的 bl/blx 地址回填是给独立反汇编

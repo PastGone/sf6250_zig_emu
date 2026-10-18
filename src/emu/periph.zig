@@ -640,11 +640,9 @@ fn periphWrite(self: *Machine, addr: u32, size: u32, value: u64) void {
         }
         self.xfer2_writes += 1;
         leWrite(self.xfer2_regs[0..], off, size, value);
-        // +0x04 = 19：硬件 ALICE 解码引擎「触发」。固件（MAUI sub_100324B8）先配好
-        // 0xA0520000 的 ALICE 区间寄存器与 DMA 目标，随后调用 sub_1003A448 写 19，
-        // 紧接着校验 *(0x10947980) == "CAKE"。真机由该硬件把 flash 0x108E65A8 处的
-        // ALICE_1 blob 解压到目标；这里用同一套算法（src/emu/alice.zig）在宿主侧
-        // 等价实现，写入 DMA 目标寄存器（0xA0520000 +0x00）。
+        // +0x04 = 19：ALICE 解压引擎「触发」（3 = 复位，19 = 启动）。源/目标/参数
+        // 全部来自固件此前写入 0xA0520000 的配置（见 aliceDecodeToTarget），触发后
+        // 固件立刻校验 *(dst) == "CAKE"。
         if (off == 4 and @as(u32, @truncate(value)) == 19) aliceDecodeToTarget(self);
         return;
     }
@@ -747,27 +745,77 @@ pub fn onMmioRead(_: ?*c.uc_engine, offset: u64, size: c_uint, user: ?*anyopaque
     return periphRead(ctx.machine, @truncate(ctx.base + offset), size);
 }
 
-/// 0xA0530000 硬件 ALICE 解码引擎的等价实现：把 flash 里唯一的 ALICE_1 blob
-/// （0x108E65A8，即 MAUI sub_100324B8 逐字节校验 'A''L''I''C''E''_''1' 的位置）
-/// 解压进 DMA 目标（0xA0520000 +0x00，固件配为 0x10947980）。
+/// 0xA0520000 ALICE 解压引擎的宿主侧模型：源、目标、参数全部消费固件写入的
+/// 寄存器（不硬编码任何镜像地址），算法内核是 src/emu/alice.zig。
 ///
-/// 依据（HANDOFF §9.8 + 实测）：目标范围 0x10947980..0x10F39680 = 0x5F1D00 字节，
-/// 与离线解压输出长度 0x5F1CFE 吻合（差 2 字节为块对齐填充）；固件紧随其后
-/// 校验 *(0x10947980) == "CAKE"，而解压输出正好以 "CAKE" 开头。
+/// 寄存器协议（MAUI sub_100324B8 反汇编 + 200M 运行日志实测）：
+///   +0x00        解压目标起址（实测 0x10947980）
+///   +0x04        解压目标终址（(dst+size+63) & ~63，实测 0x10F39680）
+///   +0x08        mapping 表绝对地址 = blob 头 +0x0c 的 u32（实测 0x10DA1A68）
+///   +0x0c        喂进数据窗口 0xA0521000 的字节数（实测 0x2000）
+///   +0x10~+0x28  七个 u16 区间寄存器初值（固件从 blob 头 +0x14 抄写，逐个断言 <32）
+///   +0x2c        块大小-1（实测 0xfff → 块 0x1000）
+///   +0x32        (blob >> 26) << 10 = 所在 bank 号（实测 0x1000 → bank 4 = 0x10000000 窗口）
+///   +0x34        bit0 启动、bit31 就绪（读侧应答固件轮询）；+0x38 bit0
+///   +0x3c        低 4 位调用方参数（实测 9）；+0x80/+0x84 = blob 头 +0x22/+0x23
+///                低 4 位 << 28（实测 0x90000000 / 0x10000000）
+///   字典（2×Σ2^v 字节）由固件 memcpy 进数据窗口。
+/// 源 blob 定位：bank 号 + mapping 绝对地址在镜像里唯一锁定一个 ALICE 分区；
+/// 解压结果写进 [dst, dst_end) 窗口，随后固件自校验 "CAKE"。
 fn aliceDecodeToTarget(self: *Machine) void {
     const img = self.img orelse return;
-    const blob_va: u32 = 0x108E_65A8;
-    const off = blob_va - machine.map.flash_window_base;
-    if (off >= img.data.len) {
-        log.err(@src(), "ALICE blob 0x{x:0>8} 超出镜像范围", .{blob_va});
+
+    // ── 消费引擎寄存器（寄存器文件基址 0xA051FF00，+0x100 = 0xA0520000）──
+    const dst: u32 = @truncate(leRead(self.xfer_regs2[0..], 0x100, 4));
+    const dst_end: u32 = @truncate(leRead(self.xfer_regs2[0..], 0x104, 4));
+    const mapping_abs: u32 = @truncate(leRead(self.xfer_regs2[0..], 0x108, 4));
+    const fifo_len: u32 = @truncate(leRead(self.xfer_regs2[0..], 0x10c, 4));
+    var range_cfg: [7]u16 = undefined;
+    for (0..7) |i| range_cfg[i] = @truncate(leRead(self.xfer_regs2[0..], @intCast(0x110 + i * 4), 4));
+    const blk_raw: u32 = @truncate(leRead(self.xfer_regs2[0..], 0x12c, 4));
+    const blk: u32 = blk_raw + 1;
+    const bank_u16: u16 = @truncate(leRead(self.xfer_regs2[0..], 0x132, 2));
+    const bank: u8 = @truncate((bank_u16 >> 10) & 0x3f);
+    const param3c: u8 = @truncate(leRead(self.xfer_regs2[0..], 0x13c, 4) & 0xf);
+    const n80: u8 = @truncate(leRead(self.xfer_regs2[0..], 0x180, 4) >> 28);
+    const n84: u8 = @truncate(leRead(self.xfer_regs2[0..], 0x184, 4) >> 28);
+    if (bank_u16 == 0 and mapping_abs == 0) {
+        log.err(@src(), "[ALICE] 触发但引擎未配置源（+0x32/+0x08 全 0），拒绝解压", .{});
         return;
     }
-    const decoded = alice.decompress(self.allocator, img.data[off..]) catch |e| {
+    log.info(@src(), "  [ALICE] 引擎配置: dst=0x{x:0>8} dst_end=0x{x:0>8} mapping=0x{x:0>8} fifo={d} blk={d} bank={d} range={any} p3c={d} n80={x} n84={x}", .{
+        dst, dst_end, mapping_abs, fifo_len, blk, bank, range_cfg, param3c, n80, n84,
+    });
+
+    // ── 源定位：bank + mapping 绝对地址双重匹配镜像里的 ALICE 分区 ──
+    const blob_off = findAliceBlob(img.data, bank_u16, mapping_abs) orelse {
+        log.err(@src(), "[ALICE] 源定位失败: bank={d} mapping=0x{x:0>8} 无匹配分区", .{ bank, mapping_abs });
+        return;
+    };
+    const blob = img.data[blob_off..];
+    const blob_va = machine.map.flash_window_base + @as(u32, @intCast(blob_off));
+    const exact = mapping_abs != 0 and std.mem.readInt(u32, blob[12..16], .little) == mapping_abs;
+    log.info(@src(), "  [ALICE] 源定位: blob=0x{x:0>8}（{s}）", .{
+        blob_va,
+        if (exact) "bank+mapping 双匹配" else "bank 匹配",
+    });
+
+    // 区间寄存器交叉校验：固件是从 blob 头抄给引擎的，应逐项一致
+    for (0..7) |i| {
+        const h = std.mem.readInt(u16, blob[20 + i * 2 ..][0..2], .little);
+        if (h != range_cfg[i]) {
+            log.warn(@src(), "  [ALICE] 区间寄存器[{d}] 引擎={d} ≠ blob头={d}", .{ i, range_cfg[i], h });
+        }
+    }
+
+    const decoded = alice.decompress(self.allocator, blob) catch |e| {
         log.err(@src(), "ALICE 解压失败 ({s})", .{@errorName(e)});
         return;
     };
     defer self.allocator.free(decoded);
-    const dst = leRead(self.xfer_regs2[0..], 0x100, 4);
+    if (dst_end > dst and decoded.len > dst_end - dst) {
+        log.warn(@src(), "  [ALICE] 解压输出 {d} 字节超出目标窗口 {d} 字节", .{ decoded.len, dst_end - dst });
+    }
     if (c.uc_mem_write(self.eng.handle, dst, decoded.ptr, decoded.len) != c.UC_ERR_OK) {
         log.err(@src(), "ALICE 写目标 0x{x:0>8} 失败 (len=0x{x})", .{ dst, decoded.len });
         return;
@@ -777,6 +825,25 @@ fn aliceDecodeToTarget(self: *Machine) void {
     log.info(@src(), "  [ALICE] 引擎触发 → 解压 {d} 字节 → 目标 0x{x:0>8} magic={s}", .{
         decoded.len, dst, if (ok) magic[0..4] else "????",
     });
+}
+
+/// 在镜像里扫描 ALICE_1/ALICE_2 魔数，用引擎寄存器里的 bank 号（+0x32）与
+/// mapping 表绝对地址（+0x08）定位源分区。返回镜像文件内偏移；bank 已知时
+/// 优先返回 mapping 精确匹配者，否则退回第一个 bank 匹配者。
+fn findAliceBlob(data: []const u8, bank_u16: u16, mapping_abs: u32) ?usize {
+    var fallback: ?usize = null;
+    var off: usize = 0;
+    while (off + 40 <= data.len) : (off += 4) {
+        const d = data[off..];
+        if (!std.mem.eql(u8, d[0..7], "ALICE_1") and !std.mem.eql(u8, d[0..7], "ALICE_2")) continue;
+        if (bank_u16 != 0) {
+            const va: u32 = machine.map.flash_window_base + @as(u32, @intCast(off));
+            if ((va >> 26) != ((bank_u16 >> 10) & 0x3f)) continue;
+        }
+        if (mapping_abs != 0 and std.mem.readInt(u32, d[12..16], .little) == mapping_abs) return off;
+        if (fallback == null) fallback = off;
+    }
+    return fallback;
 }
 
 /// dump 传输引擎 FIFO（0xA0521000）的 32 字节——启动 DMA 时的源数据
